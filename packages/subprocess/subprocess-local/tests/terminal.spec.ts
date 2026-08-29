@@ -576,6 +576,8 @@ describe('process-table read amplification', () => {
       internals: {
         readFile: unreachable,
         readDir: unreachable,
+        readDirAsync: unreachable,
+        readFileAsync: unreachable,
         readLink: unreachable,
         stat: unreachable,
         open: unreachable,

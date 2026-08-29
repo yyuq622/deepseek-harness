@@ -6,7 +6,6 @@ import {
 } from '@deepseek-ai/dsh-subprocess-local/src/process-inspector.ts'
 import type { ProcessInspectorInternals } from '@deepseek-ai/dsh-subprocess-local/src/process-inspector.ts'
 import { WindowsProcessInspector } from '@deepseek-ai/dsh-subprocess-local/src/windows-inspector.ts'
-
 function stat(
   pid: number,
   pgrp: number,
@@ -51,6 +50,16 @@ function fakeInternals() {
       if (value === undefined) throw new Error(`missing ${path}`)
       return value
     },
+    async readDirAsync(path) {
+      const value = dirs.get(path)
+      if (value === undefined) throw new Error(`missing ${path}`)
+      return value
+    },
+    async readFileAsync(path) {
+      const value = files.get(path)
+      if (value === undefined) throw new Error(`missing ${path}`)
+      return value
+    },
     readLink(path) {
       const value = links.get(path)
       if (value === undefined) throw new Error(`missing ${path}`)
@@ -89,19 +98,19 @@ function fakeInternals() {
 }
 
 describe('Linux process inspector', () => {
-  it('treats zombie-only process groups as quiescent and fails closed when unobservable', () => {
+  it('treats zombie-only process groups as quiescent and fails closed when unobservable', async () => {
     const fake = fakeInternals()
-    expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).toBeUndefined()
+    await expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).resolves.toBeUndefined()
 
     fake.dirs.set('/proc', ['self', '10', '11', '12'])
     fake.files.set('/proc/10/stat', stat(10, 77, 10, -1, '500', 1, 'Z'))
     fake.files.set('/proc/11/stat', stat(11, 77, 10, -1, '501', 1, 'X'))
     fake.files.set('/proc/12/stat', stat(12, 88, 12, -1, '502'))
-    expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).toBe(false)
-    expect(linuxProcessGroupHasLiveMembers(99, fake.internals)).toBeUndefined()
+    await expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).resolves.toBe(false)
+    await expect(linuxProcessGroupHasLiveMembers(99, fake.internals)).resolves.toBeUndefined()
 
     fake.files.set('/proc/11/stat', stat(11, 77, 10, -1, '501'))
-    expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).toBe(true)
+    await expect(linuxProcessGroupHasLiveMembers(77, fake.internals)).resolves.toBe(true)
   })
 
   it('parses stat safely, captures only the rooted process tree, and signals identities', () => {

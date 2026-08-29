@@ -1,6 +1,7 @@
 /** Platform process-table inspection for terminal readiness, signals, and teardown. */
 
 import { closeSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, statSync } from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import type { SubprocessTerminalSignal } from '@deepseek-ai/dsh-subprocess'
 import { createWindowsProcessInspector } from './windows-inspector.ts'
@@ -99,6 +100,14 @@ export interface ProcessInspector {
 export interface ProcessInspectorInternals {
   readFile(path: string): string
   readDir(path: string): string[]
+  /**
+   * Asynchronous directory read for the /proc walk — the observer polls it
+   * every tick after settlement, so the walk must not block the event loop
+   * on thousands of directory entries.
+   */
+  readDirAsync(path: string): Promise<string[]>
+  /** Asynchronous file read, the {@link readDirAsync} counterpart. */
+  readFileAsync(path: string): Promise<string>
   readLink(path: string): string
   stat(path: string): FileStatus
   open(path: string): number
@@ -112,6 +121,8 @@ export interface ProcessInspectorInternals {
 const DEFAULT_INTERNALS: ProcessInspectorInternals = {
   readFile: path => readFileSync(path, 'utf8'),
   readDir: path => readdirSync(path),
+  readDirAsync: path => readdir(path),
+  readFileAsync: path => readFile(path, 'utf8'),
   readLink: path => readlinkSync(path, 'utf8'),
   stat: path => statSync(path),
   open: path => openSync(path, 'r'),
@@ -164,6 +175,14 @@ function readLinuxStat(internals: ProcessInspectorInternals, pid: number): ProcS
   }
 }
 
+async function readLinuxStatAsync(internals: ProcessInspectorInternals, pid: number): Promise<ProcStat | undefined> {
+  try {
+    return parseProcStat(await internals.readFileAsync(`/proc/${pid}/stat`))
+  } catch (_unreadableProcEntry) {
+    return undefined
+  }
+}
+
 // `/proc/<pid>/stat` renders tty_nr as a signed 32-bit device number, while
 // Node exposes the same st_rdev bits as a nonnegative number.
 function linuxDeviceNumber(value: number): number {
@@ -196,25 +215,27 @@ function readLinuxTerminalDevice(
 /**
  * Report whether a Linux process group has an executing member. `false`
  * means the group contains only zombie/dead entries; `undefined` means the
- * process table could not prove either outcome.
+ * process table could not prove either outcome. The /proc walk reads
+ * asynchronously: the spawn-loop observer polls it every tick after
+ * settlement, so the walk must not block the event loop.
  * @param processGroupId - POSIX process-group id to inspect.
  * @param internals - injectable process-table operations.
  * @returns Live-member presence, or `undefined` when unavailable/absent.
  */
-export function linuxProcessGroupHasLiveMembers(
+export async function linuxProcessGroupHasLiveMembers(
   processGroupId: number,
   internals: ProcessInspectorInternals = DEFAULT_INTERNALS,
-): boolean | undefined {
+): Promise<boolean | undefined> {
   let entries: string[]
   try {
-    entries = internals.readDir('/proc')
+    entries = await internals.readDirAsync('/proc')
   } catch (_unreadableProcDirectory) {
     return undefined
   }
   let matched = false
   for (const entry of entries) {
     if (!/^\d+$/.test(entry)) continue
-    const stat = readLinuxStat(internals, Number(entry))
+    const stat = await readLinuxStatAsync(internals, Number(entry))
     if (stat?.pgrp !== processGroupId) continue
     matched = true
     if (!/^[ZXx]$/.test(stat.state)) return true

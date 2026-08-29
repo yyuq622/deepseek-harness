@@ -717,14 +717,15 @@ describe('windows tree sweep wiring (injected sweep)', () => {
       platform: 'win32',
       win32TreeSweep: {
         captureRootIdentity: (rootPid) => { captured = rootPid; return 'root-identity' },
-        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return true },
+        async sweep(rootPid, identity) { sweeps.push({ pid: rootPid, identity }); return true },
         hasLiveWork: () => true,
       },
     })
     expect(captured).toBe(running.pid)
 
     running.terminate()
-    expect(sweeps).toEqual([{ pid: running.pid, identity: 'root-identity' }])
+    // The tier delivers asynchronously; the arming follows its outcome.
+    await vi.waitFor(() => expect(sweeps).toEqual([{ pid: running.pid, identity: 'root-identity' }]))
     // The escalation re-sweeps once after the grace period.
     await vi.waitFor(() => expect(sweeps).toHaveLength(2))
 
@@ -749,12 +750,12 @@ describe('windows tree sweep wiring (injected sweep)', () => {
       platform: 'win32',
       win32TreeSweep: {
         captureRootIdentity: () => 'root-identity',
-        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return false },
+        async sweep(rootPid, identity) { sweeps.push({ pid: rootPid, identity }); return false },
         hasLiveWork: () => false,
       },
     })
     running.terminate()
-    expect(sweeps).toHaveLength(1)
+    await vi.waitFor(() => expect(sweeps).toHaveLength(1))
     // Three grace periods: the escalation must never arm for an absent tree.
     await new Promise(resolve => setTimeout(resolve, 120))
     expect(sweeps).toHaveLength(1)
@@ -773,12 +774,12 @@ describe('windows tree sweep wiring (injected sweep)', () => {
       platform: 'win32',
       win32TreeSweep: {
         captureRootIdentity: () => 'root-identity',
-        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return true },
+        async sweep(rootPid, identity) { sweeps.push({ pid: rootPid, identity }); return true },
         hasLiveWork: () => false,
       },
     })
     running.terminate()
-    expect(sweeps).toHaveLength(1)
+    await vi.waitFor(() => expect(sweeps).toHaveLength(1))
     try {
       process.kill(running.pid, 'SIGKILL')
     } catch {

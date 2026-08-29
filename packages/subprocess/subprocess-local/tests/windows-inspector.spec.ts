@@ -24,6 +24,7 @@ function fakeInternals() {
       snapshot: () => { counts.enumerations += 1; return [...entries] },
       processState: (pid) => { counts.stateReads += 1; return states.get(pid) },
       taskkill: (pid: number, force: boolean) => { kills.push([pid, force]) },
+      async taskkillAsync(pid: number, force: boolean) { kills.push([pid, force]) },
     } satisfies WindowsProcessInspectorInternals,
     add(entry: ProcessEntry, started?: string, active = true): void {
       entries.push(entry)
@@ -140,57 +141,57 @@ describe('WindowsProcessInspector (injected internals)', () => {
 })
 
 describe('windows tree sweep (injected internals)', () => {
-  it('terminates a live root whose creation identity still matches the captured one', () => {
+  it('terminates a live root whose creation identity still matches the captured one', async () => {
     const fake = fakeInternals()
     fake.add({ pid: 10, parentPid: 0 }, 't10')
     const sweep = createWindowsTreeSweep(fake.internals)
     expect(sweep.captureRootIdentity(10)).toBe('t10')
-    expect(sweep.sweep(10, 't10')).toBe(true)
+    await expect(sweep.sweep(10, 't10')).resolves.toBe(true)
     expect(fake.kills).toEqual([[10, true]])
   })
 
-  it('refuses a root pid whose occupant was reused since the spawn', () => {
+  it('refuses a root pid whose occupant was reused since the spawn', async () => {
     const fake = fakeInternals()
     fake.add({ pid: 10, parentPid: 0 }, 'reused')
     const sweep = createWindowsTreeSweep(fake.internals)
-    expect(sweep.sweep(10, 't10')).toBe(false)
+    await expect(sweep.sweep(10, 't10')).resolves.toBe(false)
     expect(fake.kills).toEqual([])
   })
 
-  it('falls back to pid-targeted termination when the spawn captured no identity', () => {
+  it('falls back to pid-targeted termination when the spawn captured no identity', async () => {
     const kills: Array<[number, boolean]> = []
     const sweep = createWindowsTreeSweep({
       snapshot: () => [{ pid: 10, parentPid: 0 }],
       processState: () => ({ started: 't10', active: true }),
       taskkill: (pid, force) => { kills.push([pid, force]) },
     })
-    expect(sweep.sweep(10, undefined)).toBe(true)
+    await expect(sweep.sweep(10, undefined)).resolves.toBe(true)
     expect(kills).toEqual([[10, true]])
   })
 
-  it('sweeps the surviving descendants of an exited root, children-first', () => {
+  it('sweeps the surviving descendants of an exited root, children-first', async () => {
     const fake = fakeInternals()
     // The exited root has no table entry; its descendants keep the parent link.
     fake.add({ pid: 11, parentPid: 10 }, 't11')
     fake.add({ pid: 12, parentPid: 11 }, 't12')
     fake.add({ pid: 13, parentPid: 11 }, 't13', false) // already exiting: re-verify skips it
     const sweep = createWindowsTreeSweep(fake.internals)
-    expect(sweep.sweep(10, 't10')).toBe(true)
+    await expect(sweep.sweep(10, 't10')).resolves.toBe(true)
     expect(fake.kills).toEqual([[12, true], [11, true]])
   })
 
-  it('sweeps orphans when the exited root stays readable through held handles', () => {
+  it('sweeps orphans when the exited root stays readable through held handles', async () => {
     // OpenProcess and GetProcessTimes keep succeeding for an exited process
     // whose handles are still open; only the wait state says it is gone.
     const fake = fakeInternals()
     fake.add({ pid: 10, parentPid: 0 }, 't10', false)
     fake.add({ pid: 11, parentPid: 10 }, 't11')
     const sweep = createWindowsTreeSweep(fake.internals)
-    expect(sweep.sweep(10, 't10')).toBe(true)
+    await expect(sweep.sweep(10, 't10')).resolves.toBe(true)
     expect(fake.kills).toEqual([[11, true]])
   })
 
-  it('skips an orphan whose pid was reused between the snapshot and the kill', () => {
+  it('skips an orphan whose pid was reused between the snapshot and the kill', async () => {
     const kills: Array<[number, boolean]> = []
     let descendantReads = 0
     const sweep = createWindowsTreeSweep({
@@ -204,7 +205,7 @@ describe('windows tree sweep (injected internals)', () => {
       },
       taskkill: (pid, force) => { kills.push([pid, force]) },
     })
-    expect(sweep.sweep(10, 't10')).toBe(false)
+    await expect(sweep.sweep(10, 't10')).resolves.toBe(false)
     expect(kills).toEqual([])
   })
 

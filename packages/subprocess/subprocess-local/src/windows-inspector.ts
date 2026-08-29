@@ -9,7 +9,7 @@
  * @module dsh-subprocess-local/windows-inspector
  */
 
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import koffi from 'koffi'
 import type { SubprocessTerminalSignal } from '@deepseek-ai/dsh-subprocess'
 import type { ProcessIdentity, ProcessInspector, ProcessSnapshot } from './process-inspector.ts'
@@ -34,8 +34,19 @@ export interface WindowsProcessInspectorInternals {
   snapshot(): ProcessEntry[]
   /** Return one process's creation identity and wait state, or undefined when unreadable. */
   processState(pid: number): WindowsProcessState | undefined
-  /** Terminate one process tree; `force` maps to taskkill `/F`. */
+  /**
+   * Terminate one process tree synchronously; `force` maps to taskkill `/F`.
+   * The synchronous form is the host-exit guarantee (the exit phase cannot
+   * await) and the test-fake fallback.
+   */
   taskkill(pid: number, force: boolean): void
+  /**
+   * Terminate one process tree through an asynchronous taskkill spawn, so a
+   * cancellation tier never blocks the event loop on `taskkill /T`'s
+   * tree walk. Optional: test fakes without it fall back to the synchronous
+   * {@link taskkill}, whose delivery is then instant.
+   */
+  taskkillAsync?(pid: number, force: boolean): Promise<void>
 }
 
 /**
@@ -157,12 +168,28 @@ export class WindowsProcessInspector implements ProcessInspector {
     }
   }
 
+  /** One contained taskkill delivery: asynchronous when available, synchronous otherwise. */
+  private deliver(pid: number, force: boolean): Promise<void> {
+    let delivery: Promise<void>
+    try {
+      delivery = this.internals.taskkillAsync !== undefined
+        ? this.internals.taskkillAsync(pid, force)
+        : Promise.resolve(this.internals.taskkill(pid, force))
+    } catch {
+      // A synchronous fake that throws is contained like the real forms.
+      return Promise.resolve()
+    }
+    return delivery.catch(() => {})
+  }
+
   signalGroup(pgid: number, signal: SubprocessTerminalSignal): void {
-    this.internals.taskkill(pgid, signal === 'SIGKILL')
+    // The delivery spawns asynchronously; the terminal teardown's re-sweep
+    // observes actual absence, which is the quiescence await.
+    void this.deliver(pgid, signal === 'SIGKILL')
   }
 
   signalProcess(identity: ProcessIdentity, signal: 'SIGTERM' | 'SIGKILL'): void {
-    if (this.isAlive(identity)) this.internals.taskkill(identity.pid, signal === 'SIGKILL')
+    if (this.isAlive(identity)) void this.deliver(identity.pid, signal === 'SIGKILL')
   }
 }
 /* jscpd:ignore-end */
@@ -187,6 +214,21 @@ function taskkillTree(pid: number, force: boolean): void {
 }
 
 /**
+ * Asynchronous {@link taskkillTree}: the delivery spawns taskkill without
+ * blocking the event loop on its tree walk, and resolves when the spawned
+ * taskkill has exited. An already-absent tree, exit races, and a missing
+ * binary resolve — the same tolerated outcomes as the sync form.
+ */
+function taskkillTreeAsync(pid: number, force: boolean): Promise<void> {
+  if (pid <= 0) return Promise.resolve()
+  return new Promise((resolve) => {
+    const child = spawn('taskkill', ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], { stdio: 'ignore' })
+    child.on('close', () => resolve())
+    child.on('error', () => resolve())
+  })
+}
+
+/**
  * Identity-fenced Windows tree termination for one spawned root. The root's
  * creation-time identity is captured right after spawn; every termination
  * consults the process table first, so a reused root pid is never terminated,
@@ -207,12 +249,23 @@ export interface WindowsTreeSweep {
    * identity must still match the captured one), or — once the root is gone —
    * every surviving descendant reachable by parent link, each re-verified by
    * identity immediately before its own taskkill. Force is always set: any
-   * Windows signal maps to TerminateProcess semantics.
+   * Windows signal maps to TerminateProcess semantics. The taskkill
+   * deliveries spawn asynchronously, so a termination tier never blocks the
+   * event loop on taskkill's tree walk.
    * @param rootPid - the spawned root's pid.
    * @param rootIdentity - the identity captured at spawn; undefined falls back to pid-targeted termination of a live root.
    * @returns true when a live root was terminated or at least one descendant was killed; false when nothing alive was found, or the root pid was reused.
    */
-  sweep(rootPid: number, rootIdentity: string | undefined): boolean
+  sweep(rootPid: number, rootIdentity: string | undefined): Promise<boolean>
+  /**
+   * The synchronous form for the host-exit phase, which cannot await: the
+   * same identity-fenced targets, delivered through the synchronous taskkill
+   * (no promises or timers, per the host-exit contract).
+   * @param rootPid - the spawned root's pid.
+   * @param rootIdentity - the identity captured at spawn.
+   * @returns true when a live root was terminated or at least one descendant was killed.
+   */
+  sweepSync(rootPid: number, rootIdentity: string | undefined): boolean
   /**
    * Read-only sweep question: whether any live work remains — a live root the
    * sweep would terminate, or at least one surviving descendant. Never
@@ -261,9 +314,47 @@ function resolveSweepTargets(
 export function createWindowsTreeSweep(
   internals: WindowsProcessInspectorInternals = defaultWindowsProcessInternals(),
 ): WindowsTreeSweep {
+  /** One contained taskkill delivery: asynchronous when available, synchronous otherwise. */
+  const deliver = (pid: number, force: boolean): Promise<void> => {
+    let delivery: Promise<void>
+    try {
+      delivery = internals.taskkillAsync !== undefined
+        ? internals.taskkillAsync(pid, force)
+        : Promise.resolve(internals.taskkill(pid, force))
+    } catch {
+      // A synchronous fake that throws is contained like the real forms.
+      return Promise.resolve()
+    }
+    return delivery.catch(() => {})
+  }
   return {
     captureRootIdentity: rootPid => internals.processState(rootPid)?.started,
-    sweep: (rootPid, rootIdentity) => {
+    sweep: async (rootPid, rootIdentity) => {
+      const { terminateRoot, orphans } = resolveSweepTargets(
+        internals,
+        internals.snapshot(),
+        rootPid,
+        rootIdentity,
+      )
+      let killed = false
+      const deliveries: Promise<void>[] = []
+      if (terminateRoot) {
+        deliveries.push(deliver(rootPid, true))
+        killed = true
+      }
+      for (const identity of orphans) {
+        // Re-verify immediately before the kill: a candidate that exited and
+        // whose pid was reused between the snapshot and this kill is skipped
+        // rather than signalled.
+        const current = internals.processState(identity.pid)
+        if (current === undefined || !current.active || current.started !== identity.started) continue
+        deliveries.push(deliver(identity.pid, true))
+        killed = true
+      }
+      await Promise.all(deliveries)
+      return killed
+    },
+    sweepSync: (rootPid, rootIdentity) => {
       const { terminateRoot, orphans } = resolveSweepTargets(
         internals,
         internals.snapshot(),
@@ -276,9 +367,6 @@ export function createWindowsTreeSweep(
         killed = true
       }
       for (const identity of orphans) {
-        // Re-verify immediately before the kill: a candidate that exited and
-        // whose pid was reused between the snapshot and this kill is skipped
-        // rather than signalled.
         const current = internals.processState(identity.pid)
         if (current === undefined || !current.active || current.started !== identity.started) continue
         internals.taskkill(identity.pid, true)
@@ -495,5 +583,6 @@ function defaultWindowsProcessInternals(): WindowsProcessInspectorInternals {
     snapshot: () => snapshotWindowsProcesses(win32Bindings()),
     processState: pid => windowsProcessState(win32Bindings(), pid),
     taskkill: taskkillTree,
+    taskkillAsync: taskkillTreeAsync,
   }
 }

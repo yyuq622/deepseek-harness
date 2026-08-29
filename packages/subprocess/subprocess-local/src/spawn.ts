@@ -57,8 +57,8 @@ export interface SpawnInternals {
   taskkill?: (pid: number) => void
   /** Host platform override for signalling decisions. */
   platform?: NodeJS.Platform
-  /** Linux process-group member probe (defaults to `/proc` inspection). */
-  linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined
+  /** Linux process-group member probe (defaults to `/proc` inspection); may deliver its walk asynchronously. */
+  linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined | Promise<boolean | undefined>
   /** Notified once per created spill file so the owning runtime can track and reclaim it on disposal. */
   onSpillFileCreated?: (path: string) => void
   /**
@@ -439,11 +439,6 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
     }
     try {
       process.kill(-pid, 0)
-      // A group containing only unreaped zombies still answers kill(0), but
-      // it can execute no work and cannot be signalled into quiescence. Only
-      // inspect after direct-child settlement so live-process polls remain a
-      // syscall rather than repeated process-table scans.
-      if (settled && platform === 'linux' && linuxGroupHasLiveMembers(pid) === false) return false
       return true
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
@@ -467,7 +462,16 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
    */
   const observeTreeExit = (): Promise<void> => {
     treeExitObservation ??= (async () => {
-      while (treeAlive()) await sleepTick()
+      // After settlement the Linux probe refines the group answer
+      // asynchronously: a group of only zombie/dead members answers kill(0)
+      // but can neither run nor be signalled into quiescence, so it must read
+      // as absent — without freezing the loop on a synchronous /proc walk.
+      const settledAlive = async (): Promise<boolean> => {
+        if (!treeAlive()) return false
+        if (!settled || platform !== 'linux') return true
+        return await linuxGroupHasLiveMembers(pid) !== false
+      }
+      while (await settledAlive()) await sleepTick()
       treeExitObserved = true
       if (platform === 'win32') {
         // The direct child's exit is not tree absence on Windows — descendants
@@ -489,9 +493,12 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
   // One Windows termination tier: the identity-fenced sweep, or — when no
   // sweep is available (a non-Windows host running win32-semantics tests) —
   // the legacy pid-targeted guard. Any Windows signal force-terminates, so
-  // the signal value never reaches this tier.
-  const win32TerminateTier = (): boolean => {
-    if (win32TreeSweep !== undefined) return win32TreeSweep.sweep(pid, rootIdentity)
+  // the signal value never reaches this tier. The sweep's taskkill
+  // deliveries spawn asynchronously; the tier resolves once they have been
+  // delivered.
+  let win32TierInFlight = false
+  const win32TerminateTier = async (): Promise<boolean> => {
+    if (win32TreeSweep !== undefined) return await win32TreeSweep.sweep(pid, rootIdentity)
     if (treeAlive()) {
       taskkill(pid)
       return true
@@ -505,10 +512,11 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
   // direct child and must stay signalable, while a fully-dead group (possible
   // pid reuse) must not be re-signalled by a later tier. Windows termination
   // is identity-fenced instead, so it also reaches the descendants of a root
-  // that exited on its own.
+  // that exited on its own; its delivery is asynchronous, and the outcome
+  // stays observable through `done` and the exit observer.
   const kill = (sig: NodeJS.Signals): void => {
     if (platform === 'win32') {
-      win32TerminateTier()
+      void win32TerminateTier()
       return
     }
     /* v8 ignore next -- the shared exit observer cancels the ordinary dead-tree timer;
@@ -518,16 +526,22 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
   }
 
   const terminate = (): void => {
-    if (graceTimer !== undefined) return
+    if (graceTimer !== undefined || win32TierInFlight) return
     if (platform === 'win32') {
-      // Tier 1 IS the sweep. Arming follows its outcome: a sweep that
-      // terminated something keeps the SIGKILL re-sweep committed, and one
-      // that found nothing alive — or a reused root pid — leaves nothing to
-      // escalate. The timer stays ref'd: the pending re-sweep is a
-      // commitment, and a parent exiting before it fires would leave the
-      // reaped-orphan race window unguarded. Self-bounds at graceMs.
-      if (!win32TerminateTier()) return
-      graceTimer = setTimeout(() => { win32TerminateTier() }, spec.graceMs)
+      // Tier 1 IS the sweep, delivered asynchronously. Arming follows its
+      // outcome once delivery completes: a sweep that terminated something
+      // keeps the SIGKILL re-sweep committed, and one that found nothing
+      // alive — or a reused root pid — leaves nothing to escalate. The timer
+      // stays ref'd: the pending re-sweep is a commitment, and a parent
+      // exiting before it fires would leave the reaped-orphan race window
+      // unguarded. Self-bounds at graceMs.
+      win32TierInFlight = true
+      void win32TerminateTier().then((touched) => {
+        win32TierInFlight = false
+        if (touched && graceTimer === undefined && !treeExitObserved) {
+          graceTimer = setTimeout(() => { void win32TerminateTier() }, spec.graceMs)
+        }
+      }, () => { win32TierInFlight = false })
       return
     }
     // Observe from the first termination tier onward, even when inherited
@@ -540,6 +554,12 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
   }
 
   const terminateForHostExit = (): void => {
+    if (platform === 'win32' && win32TreeSweep !== undefined) {
+      // The exit phase cannot await: the synchronous sweep is the final
+      // identity-fenced guarantee — no promises or timers, per the contract.
+      win32TreeSweep.sweepSync(pid, rootIdentity)
+      return
+    }
     kill('SIGKILL')
   }
 
