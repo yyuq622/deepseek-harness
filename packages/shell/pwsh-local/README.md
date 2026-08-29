@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-pwsh-local` is the PowerShell executor: every command runs as a fresh, non-interactive `pwsh -Command` process with no profile files, so no shell state survives between calls. It mirrors `dsh-bash-local`'s semantics call-for-call and adds PowerShell-shaped concerns: executable resolution, UTF-8 output pinning, and the model-friendly terminal environment. Commands run with the harness process's own authority — this executor confines nothing; compose `dsh-pwsh-sandbox` when commands need the sandbox capability. The model-facing `pwsh` tool talks to it once it is mounted.
+`dsh-pwsh-local` is the PowerShell executor: every command runs as a fresh, non-interactive `pwsh -Command` process with no profile files, so no shell state survives between calls. It shares `dsh-bash-local`'s semantics through the common local executor base and adds PowerShell-shaped concerns: executable resolution, UTF-8 output pinning, and the model-friendly terminal environment. Commands run with the harness process's own authority — this executor confines nothing; compose `dsh-pwsh-sandbox` when commands need the sandbox capability. The model-facing `pwsh` tool talks to it once it is mounted.
 
 ## Table of Contents
 
@@ -117,7 +117,7 @@ A call runs through three steps: `resolve()` fills `workdir`/`timeoutMs`/`stdout
 Read these pages when the executor contract is not enough. They move from the seam to the confining sibling and the PowerShell tool.
 
 - [shell seam](../shell/README.md) — the executor contract this provider implements, including the request/spec split.
-- [bash-local](../bash-local/README.md) — the POSIX counterpart this executor mirrors call-for-call.
+- [bash-local](../bash-local/README.md) — the POSIX counterpart sharing this executor's local executor base.
 - [pwsh-sandbox](../pwsh-sandbox/README.md) — the confining executor to compose instead when commands need the sandbox capability.
 - [tool-pwsh](../tool-pwsh/README.md) — the model-facing `pwsh` tool over this executor.
 - [Bash executor subsystem](../../../docs/subsystems/shell.md) — request/spec vocabulary, results, and the service contract in full.
