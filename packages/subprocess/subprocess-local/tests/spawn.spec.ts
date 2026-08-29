@@ -1,11 +1,12 @@
-import { mkdtempSync, readFileSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import {
   childEnv,
   killGroup,
   OutputCollector,
+  removeProcessSpillDir,
   spawnSubprocess,
   taskkillProcessTree,
 } from '../src/spawn.ts'
@@ -627,6 +628,35 @@ describe('stdio dispositions', () => {
     expect(read.lossy).toBe(true)
     expect(read.text).toContain('line-0200')
     expect(read.spillPath).toBeUndefined()
+  })
+})
+
+describe('process-exit spill reclamation', () => {
+  it('removes the process default spill directory and its files at exit', async () => {
+    // No spillDir override: this spawn creates and uses the module's private
+    // default directory — the directory the process-exit hook owns.
+    const result = await finish(spawnSubprocess(
+      spec('for i in $(seq 1 200); do printf "line-%04d\\n" $i; done', { stdoutMaxBytes: 500, stderrMaxBytes: 500 }),
+    ))
+    const spillFile = result.stdout.spillPath
+    expect(spillFile).toBeDefined()
+    expect(existsSync(spillFile!)).toBe(true)
+    const dir = dirname(spillFile!)
+    expect(basename(dir)).toMatch(/^dsh-subprocess-[A-Za-z0-9]{6}$/)
+
+    removeProcessSpillDir()
+    expect(existsSync(dir)).toBe(false)
+  })
+
+  it('recreates the default directory so a later spawn keeps spilling after a reclaim', async () => {
+    const result = await finish(spawnSubprocess(
+      spec('for i in $(seq 1 200); do printf "line-%04d\\n" $i; done', { stdoutMaxBytes: 500, stderrMaxBytes: 500 }),
+    ))
+    expect(result.stdout.spillPath).toBeDefined()
+    expect(existsSync(result.stdout.spillPath!)).toBe(true)
+
+    // Leave no default-directory residue behind the suite.
+    removeProcessSpillDir()
   })
 })
 

@@ -29,7 +29,7 @@ kind: "package-reference"
 
 ### 前台命令
 
-用已解析的 spec 调用 `run` 即可在前台执行命令。promise 在命令结束时 resolve：非零退出、执行器超时终止或调用方中止终止都是结果，绝不是 rejection。`run` 只在基础设施失败时 reject，例如工作目录不可用或缺少 shell。结果携带退出码或信号、是超时还是中止截断了运行，以及收集到的 stdout/stderr；流超出预算时还附带 spill 文件路径。
+用已解析的 spec 调用 `run` 即可在前台执行命令。promise 在命令结束时 resolve：非零退出、执行器超时终止或调用方中止终止都是结果，绝不是 rejection。`run` 只在基础设施失败时 reject，例如工作目录不可用或缺少 shell。结果携带退出码或信号、是超时还是中止截断了运行，以及收集到的 stdout/stderr；流超出预算时还附带 spill 文件路径。当请求从所属会话解析出 spill 归属时，执行器会在 `run()` resolve 之前把超限流持久化进该会话的 spill store，结果宣告的是这一持久 locator 而非原始 subprocess 临时路径；后台进程的执行器自管 spill 路径则保留到 subprocess dispose（资源释放）为止。
 
 ```text
 const result = await ctx.shell.run(ctx.shell.resolve({ command: 'ls -la' }))

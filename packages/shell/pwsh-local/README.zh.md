@@ -85,7 +85,7 @@ if (result.timedOut) console.log('timed out after', result.timeoutMs)
 
 ### 设计概念
 
-本执行器是基于 subprocess 能力的 `ctx.shell` seam 的 PowerShell Service Provider：它负责所有 pwsh 层职责——可执行文件解析、命令默认化与上限、deadline 融合与原因分类、UTF-8 输出固定、面向模型的终端环境，以及后台读取合并——而进程树机制（有界 spill 输出、凭据清除、终止升级、dispose（资源释放））属于 subprocess 服务。每次调用都 spawn 全新的非交互 `pwsh -Command`，并带 `-NoLogo -NoProfile -NonInteractive`，因此命令是确定性的，profile 状态绝不会在调用之间泄漏。
+本执行器是基于 subprocess 能力的 `ctx.shell` seam 的 PowerShell Service Provider：它负责所有 pwsh 层职责——可执行文件解析、命令默认化与上限、deadline 融合与原因分类、UTF-8 输出固定、面向模型的终端环境，以及后台读取合并——而进程树机制（有界 spill 输出、凭据清除、终止升级、dispose（资源释放））属于 subprocess 服务。前台运行若解析出会话 spill 归属，会在 `run()` resolve 之前把超限流持久化进会话的 spill store；后台与无归属的运行则把执行器自管的 spill 文件保留到 subprocess dispose 为止。每次调用都 spawn 全新的非交互 `pwsh -Command`，并带 `-NoLogo -NoProfile -NonInteractive`，因此命令是确定性的，profile 状态绝不会在调用之间泄漏。
 
 ### 源码地图
 

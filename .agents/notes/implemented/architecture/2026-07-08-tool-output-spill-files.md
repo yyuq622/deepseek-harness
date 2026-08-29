@@ -139,7 +139,7 @@ Retention is separate from spill storage:
 
 The final-result policy cannot replace tool-owned early spill. Some useful content is not present in final `ToolExecutionResult.content`:
 
-- `bash` final output is already a tail plus a temp spill path; the complete stdout/stderr streams live in executor files.
+- `bash` final output is already a tail plus a spill locator; the complete stdout/stderr streams live in executor files (handed to the session spill store for foreground runs with resolved ownership).
 - `subagent` final output is the child final answer, not the child rollout.
 - Future tools may produce runtime artifacts that are never represented by their final `ToolExecutionResult.content`.
 
@@ -156,10 +156,11 @@ Those cases can consume `ctx.spillStore` directly in later work. They are not pa
 
 ## Deferred
 
-- `saveFile()` / `linkOrCopy` for existing executor spill files, needed for bash normalization.
 - Tool-owned spill for subagent rollouts (`await run.result`, read in-process child session before `run.dispose()`, save JSONL).
 - Per-tool opt-out or per-tool policy declarations if the built-in `read` skip is insufficient.
 - Remote or database storage backends for ACP or remote environments where a local path is not meaningful.
+
+Executor-managed bash spill files are no longer deferred: a foreground run with resolved session ownership hands the raw file to the session spill store — see the [subprocess spill reclamation note](../bug-fix/2026-08-29-subprocess-spill-reclamation.md).
 
 Cleanup shipped for the local backend as a one-shot startup sweep, not tied to session deletion — see the [startup-cleanup Agent Note](./2026-07-17-local-spill-startup-cleanup.md). The seam still defines no per-session cleanup policy; retention is a backend concern.
 

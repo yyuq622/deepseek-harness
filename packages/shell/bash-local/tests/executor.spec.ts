@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -6,9 +6,27 @@ import { Context } from '@deepseek-ai/cordis'
 import { LocalBashExecutor } from '@deepseek-ai/dsh-bash-local'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { SpillLocator, SpillStore } from '@deepseek-ai/dsh-spill'
+import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ShellProcess } from '@deepseek-ai/dsh-shell'
 
 const spillDir = mkdtempSync(join(tmpdir(), 'dsh-bash-exec-spec-'))
+
+/** A recording spill backend; the handoff under test must land every save here. */
+class RecordingSpill extends SpillStore {
+  saves: SaveTextSpill[] = []
+
+  override saveText(input: SaveTextSpill): Promise<SpillRef> {
+    this.saves.push(input)
+    return Promise.resolve({
+      locator: SpillLocator(`/spill/${input.suggestedName}`),
+      bytes: Buffer.byteLength(input.content, 'utf8'),
+      retrievalHint: 'recorded',
+    })
+  }
+}
 
 async function setup(config: ConstructorParameters<typeof LocalBashExecutor>[1] = {}) {
   const ctx = new Context()
@@ -345,5 +363,59 @@ describe('process lifecycle ownership (the subprocess service, not the executor)
     await trapping.done
     expect(trapping.status).toBe('killed')
     expect(trapping.signal).toBe('SIGKILL')
+  })
+})
+
+describe('LocalBashExecutor foreground spill handoff', () => {
+  const overLimit = 'printf "%.0sx" $(seq 1 500)'
+
+  it('persists every truncated foreground stream into the owning session store and leaves no spill files behind', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-bash-spill-handoff-'))
+    try {
+      const ctx = new Context()
+      await ctx.plugin(LocalSubprocessRuntime)
+      ;(ctx.subprocess as LocalSubprocessRuntime).internals = { spillDir: dir }
+      await ctx.plugin(RecordingSpill)
+      const spill = ctx.spillStore as RecordingSpill
+      await ctx.plugin(LocalBashExecutor, { maxOutputBytes: 100 })
+      const bash = ctx.shell as LocalBashExecutor
+
+      const spillContext = { sessionId: SessionId('sess-spill-handoff'), toolName: 'bash', callId: ToolCallId('call_handoff') }
+      for (let call = 0; call < 3; call += 1) {
+        const result = await bash.run(bash.resolve({ command: overLimit, spillContext }))
+        expect(result.stdout.truncated).toBe(true)
+        expect(result.stdout.spillPath).toBe('/spill/bash-stdout.txt')
+        expect(result.stderr.truncated).toBe(false)
+      }
+
+      expect(spill.saves).toHaveLength(3)
+      expect(spill.saves[0]?.owner.sessionId).toBe('sess-spill-handoff')
+      expect(spill.saves[0]?.source).toEqual({ toolName: 'bash', callId: 'call_handoff', label: 'stdout' })
+      expect(spill.saves[0]?.content).toBe('x'.repeat(500))
+      // The sentinel: after each handoff the executor's temp spill area holds
+      // no dsh-subprocess-* files, so N over-limit commands leave none behind.
+      expect(readdirSync(dir).filter(name => name.startsWith('dsh-subprocess-'))).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('keeps the executor-managed raw spill file when the request carries no spill ownership', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-bash-spill-raw-'))
+    try {
+      const ctx = new Context()
+      await ctx.plugin(LocalSubprocessRuntime)
+      ;(ctx.subprocess as LocalSubprocessRuntime).internals = { spillDir: dir }
+      await ctx.plugin(LocalBashExecutor, { maxOutputBytes: 100 })
+      const bash = ctx.shell as LocalBashExecutor
+
+      const result = await bash.run(bash.resolve({ command: overLimit }))
+      expect(result.stdout.truncated).toBe(true)
+      expect(result.stdout.spillPath).toContain(join(dir, 'dsh-subprocess-'))
+      // Still owned by subprocess disposal and process exit, not deleted here.
+      expect(readdirSync(dir).some(name => name.startsWith('dsh-subprocess-'))).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

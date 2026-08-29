@@ -33,7 +33,7 @@ import type {} from '@deepseek-ai/dsh-user-approval'
 import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
 import { ESCALATION_TARGETS, approveEscalation, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
-import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
+import type { ShellRunResult, ShellSpillContext } from '@deepseek-ai/dsh-shell'
 import { parseExitStatus } from '@deepseek-ai/dsh-shell'
 import { processOutcome } from './background.ts'
 import { renderPwshProcessRead, renderPwshResult } from './render.ts'
@@ -154,6 +154,17 @@ function resolveWorkdir(modelWorkdir: string | undefined, exec: { agent?: Agent 
     return resolvePath(headerCwd, modelWorkdir)
   }
   return modelWorkdir
+}
+
+/**
+ * Resolve foreground spill ownership from the calling session. An ownerless
+ * call (headless plugin consumers) leaves it undefined, keeping
+ * executor-managed spill files owned by subprocess disposal and process exit.
+ */
+function spillContextOf(exec: ToolExecution): ShellSpillContext | undefined {
+  const sessionId = exec.agent?.session.header.id
+  if (sessionId === undefined) return undefined
+  return { sessionId, toolName: exec.name, callId: exec.callId }
 }
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
@@ -355,12 +366,14 @@ export function apply(ctx: Context, config: Config = {}): void {
         ? standingPolicy
         : { ...(standingPolicy as SandboxExecutionPolicy), mode: approvedMode }
       const workdir = resolveWorkdir(args.workdir, exec)
+      const spillContext = spillContextOf(exec)
       const request = {
         command: args.command,
         ...workdir !== undefined ? { workdir } : {},
         ...args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {},
         dshEnv: ctx.shellEnv.collect(exec),
         ...policy !== undefined ? { sandboxPolicy: policy } : {},
+        ...spillContext !== undefined ? { spillContext } : {},
       }
       if (args.run_in_background === true) {
         // Undeclared keys are allowed, so schema omission also needs enforcement.

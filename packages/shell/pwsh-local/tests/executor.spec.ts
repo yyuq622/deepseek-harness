@@ -9,7 +9,7 @@
  * writes CRLF on Windows, so exact text assertions normalize line endings.
  */
 
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -20,9 +20,27 @@ import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SubprocessRuntime from '@deepseek-ai/dsh-subprocess'
 import type { SubprocessHandle, SubprocessOutputReader, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { SpillLocator, SpillStore } from '@deepseek-ai/dsh-spill'
+import type { SaveTextSpill, SpillRef } from '@deepseek-ai/dsh-spill'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import type { ShellProcess } from '@deepseek-ai/dsh-shell'
 
 const spillDir = mkdtempSync(join(tmpdir(), 'dsh-pwsh-exec-spec-'))
+
+/** A recording spill backend; the handoff under test must land every save here. */
+class RecordingSpill extends SpillStore {
+  saves: SaveTextSpill[] = []
+
+  override saveText(input: SaveTextSpill): Promise<SpillRef> {
+    this.saves.push(input)
+    return Promise.resolve({
+      locator: SpillLocator(`/spill/${input.suggestedName}`),
+      bytes: Buffer.byteLength(input.content, 'utf8'),
+      retrievalHint: 'recorded',
+    })
+  }
+}
 
 // The probe follows the executor's own resolution (Program Files installs on
 // Windows are found even when bare `pwsh` is not on PATH).
@@ -501,5 +519,34 @@ describe.skipIf(!hasPwsh)('process lifecycle ownership (the subprocess service, 
     // signals) also stamps completed. Both mean the process no longer
     // survives the service.
     expect(['killed', 'completed']).toContain(running.status)
+  })
+})
+
+describe.skipIf(!hasPwsh)('PwshLocalExecutor foreground spill handoff', () => {
+  it('persists a truncated foreground stream into the owning session store and leaves no spill files behind', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-pwsh-spill-handoff-'))
+    try {
+      const ctx = new Context()
+      await ctx.plugin(LocalSubprocessRuntime)
+      ;(ctx.subprocess as LocalSubprocessRuntime).internals = { spillDir: dir }
+      await ctx.plugin(RecordingSpill)
+      const spill = ctx.spillStore as RecordingSpill
+      await ctx.plugin(PwshLocalExecutor, { maxOutputBytes: 100 })
+      const bash = ctx.shell as PwshLocalExecutor
+
+      const result = await bash.run(bash.resolve({
+        command: '[Console]::Out.Write("x" * 500)',
+        spillContext: { sessionId: SessionId('sess-pwsh-spill'), toolName: 'pwsh', callId: ToolCallId('call_pwsh_spill') },
+      }))
+
+      expect(result.stdout.truncated).toBe(true)
+      expect(result.stdout.spillPath).toBe('/spill/pwsh-stdout.txt')
+      expect(spill.saves).toHaveLength(1)
+      expect(spill.saves[0]?.content).toBe('x'.repeat(500))
+      // The sentinel: after the handoff the executor's temp spill area holds no dsh-subprocess-* files.
+      expect(readdirSync(dir).filter(name => name.startsWith('dsh-subprocess-'))).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

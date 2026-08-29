@@ -17,7 +17,7 @@
    design (see this package's README), so the two import the same seam surface */
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { SHELL_SETTINGS_NAMESPACE, ShellExecutor } from '@deepseek-ai/dsh-shell'
+import { SHELL_SETTINGS_NAMESPACE, ShellExecutor, retainSpillOutput } from '@deepseek-ai/dsh-shell'
 import type { ShellExecRequest, ShellExecSpec, ShellProcess, ShellProcessRead, ShellRunResult, CollectedOutput } from '@deepseek-ai/dsh-shell'
 import type { SubprocessCollect, SubprocessHandle, SubprocessOutputReader, SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import { installSettingsSection } from '@deepseek-ai/dsh-settings'
@@ -83,16 +83,6 @@ type ResolvedConfig = Required<Omit<Config, 'cwd' | 'pwshPath'>> & Pick<Config, 
 // Resolution lives in its own dependency-free module so the repository's
 // coverage-gate probe shares the exact definition the suites use.
 export { candidatePwshPaths, resolvePwshPath } from './resolve.ts'
-
-/** Project a settled collect-mode reader into the final CollectedOutput shape. */
-function finalOutput(reader: SubprocessOutputReader): CollectedOutput {
-  const read = reader.readFrom(0)
-  return {
-    text: read.text,
-    truncated: read.lossy,
-    ...read.spillPath !== undefined ? { spillPath: read.spillPath } : {},
-  }
-}
 
 function assertPositiveFinite(name: string, value: number): void {
   if (!Number.isFinite(value) || value <= 0) {
@@ -204,6 +194,9 @@ export class PwshLocalExecutor extends ShellExecutor {
       ...request.stdin !== undefined ? { stdin: request.stdin } : {},
       ...request.env !== undefined ? { env: request.env } : {},
       ...request.dshEnv !== undefined ? { dshEnv: request.dshEnv } : {},
+      // Foreground spill ownership, resolved by the tool layer; carried
+      // through verbatim (no defaulting) and ignored by `start()`.
+      ...request.spillContext !== undefined ? { spillContext: request.spillContext } : {},
       sandboxPolicy: request.sandboxPolicy,
     }
   }
@@ -256,6 +249,33 @@ export class PwshLocalExecutor extends ShellExecutor {
     return this.runArgv(spec, this.argv(spec))
   }
 
+  /**
+   * Project a settled collect-mode reader into the final CollectedOutput
+   * shape, handing a truncated stream to the owning session's spill store
+   * when the request resolved spill ownership. The handoff completes before
+   * `run()` resolves, so a foreground result never advertises a raw
+   * subprocess temp path; without ownership (headless plugin callers) or a
+   * mounted store the raw path stays, owned by subprocess disposal and the
+   * process-exit cleanup.
+   */
+  private async finalOutput(reader: SubprocessOutputReader, spec: ShellExecSpec, label: string): Promise<CollectedOutput> {
+    const read = reader.readFrom(0)
+    if (read.spillPath === undefined) {
+      return { text: read.text, truncated: read.lossy }
+    }
+    const context = spec.spillContext
+    const retained = context === undefined
+      ? undefined
+      : await retainSpillOutput({
+        store: this.ctx.get('spillStore'),
+        context,
+        rawPath: read.spillPath,
+        label,
+        warn: (message) => { this.ctx.logger.warn(message) },
+      })
+    return { text: read.text, truncated: read.lossy, spillPath: retained ?? read.spillPath }
+  }
+
   /** Foreground run of an exact argv (the confining subclass re-wraps it). */
   protected async runArgv(spec: ShellExecSpec, argv: readonly string[]): Promise<ShellRunResult> {
     // One deadline combines timeout and upstream cancellation; disposal clears its timer.
@@ -271,8 +291,8 @@ export class PwshLocalExecutor extends ShellExecutor {
       timedOut,
       aborted,
       timeoutMs: spec.timeoutMs,
-      stdout: finalOutput(collected.stdout),
-      stderr: finalOutput(collected.stderr),
+      stdout: await this.finalOutput(collected.stdout, spec, 'stdout'),
+      stderr: await this.finalOutput(collected.stderr, spec, 'stderr'),
     }
   }
 
@@ -283,6 +303,9 @@ export class PwshLocalExecutor extends ShellExecutor {
   /** Background start of an exact argv (the confining subclass re-wraps it). */
   protected startArgv(spec: ShellExecSpec, argv: readonly string[]): ShellProcess {
     // Background runs ignore timeoutMs; callers stop them through kill() or spec.signal.
+    // `spillContext` is deliberately ignored here: a background read may
+    // advertise its spill path mid-run, and that path must stay resolvable
+    // until subprocess disposal (or process exit) reclaims the file.
     const running = this.ctx.subprocess.spawn(this.spawnSpec(spec, this.config.maxOutputBytes, spec.signal, argv))
     const collected = PwshLocalExecutor.collected(running)
 

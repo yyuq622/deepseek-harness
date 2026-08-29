@@ -85,7 +85,7 @@ This section explains the design of the executor and points at the code that rea
 
 ### Design concept
 
-The executor is the PowerShell Service Provider for the `ctx.shell` seam built on the subprocess capability: it owns everything pwsh-shaped — executable resolution, command defaulting and caps, deadline fusion and cause classification, UTF-8 output pinning, the model-friendly terminal environment, and the background read merge — while process-tree mechanics (bounded spill-backed output, credential scrub, kill escalation, disposal) belong to the subprocess service. Every call spawns a fresh non-interactive `pwsh -Command` with `-NoLogo -NoProfile -NonInteractive`, so commands are deterministic and profile state never leaks between calls.
+The executor is the PowerShell Service Provider for the `ctx.shell` seam built on the subprocess capability: it owns everything pwsh-shaped — executable resolution, command defaulting and caps, deadline fusion and cause classification, UTF-8 output pinning, the model-friendly terminal environment, and the background read merge — while process-tree mechanics (bounded spill-backed output, credential scrub, kill escalation, disposal) belong to the subprocess service. A foreground run with resolved session spill ownership persists an oversized stream into the session's spill store before `run()` resolves; background and ownership-free runs keep executor-managed spill files until subprocess disposal. Every call spawns a fresh non-interactive `pwsh -Command` with `-NoLogo -NoProfile -NonInteractive`, so commands are deterministic and profile state never leaks between calls.
 
 ### Source map
 

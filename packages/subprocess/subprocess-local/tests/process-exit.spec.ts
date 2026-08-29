@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile, access } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execa } from 'execa'
 import { describe, expect, it, vi } from 'vitest'
@@ -10,8 +10,9 @@ import type { ProcessIdentity, ProcessInspector } from '../src/process-inspector
 import { taskkillProcessTree } from '../src/spawn.ts'
 
 type ExitTrigger = 'direct' | 'uncaught-exception' | 'unhandled-rejection' | 'dispose'
-type ManagedKind = 'ordinary' | 'terminal'
+type ManagedKind = 'ordinary' | 'terminal' | 'spill'
 interface TreeState { root: number; descendant: number }
+interface SpillState { spillPath: string }
 
 const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
 const hostScript = fileURLToPath(new URL('./fixtures/process-exit-host.ts', import.meta.url))
@@ -108,13 +109,21 @@ async function runScenario(kind: ManagedKind, trigger: ExitTrigger) {
   try {
     // The host validates tree.json before waiting for proceed, so observing it
     // is sufficient readiness; a second marker only adds a redundant Windows poll.
-    state = await readTree(join(root, 'tree.json'))
-    if (process.platform !== 'win32') identities = await captureIdentities(createProcessInspector(), state)
+    if (kind === 'spill') {
+      await vi.waitFor(async () => {
+        await readFile(join(root, 'spill.json'), 'utf8')
+      }, { interval: 10, timeout: scenarioTimeoutMs })
+    } else {
+      state = await readTree(join(root, 'tree.json'))
+      if (process.platform !== 'win32') identities = await captureIdentities(createProcessInspector(), state)
+    }
     await writeFile(join(root, 'proceed'), 'proceed')
     const outcome = await child
     settled = true
-    await waitForGone(state)
-    treeGone = true
+    if (state !== undefined) {
+      await waitForGone(state)
+      treeGone = true
+    }
     const disposeCounts = trigger === 'dispose'
       ? JSON.parse(await readFile(join(root, 'dispose.json'), 'utf8')) as {
         listenersBefore: number
@@ -122,7 +131,10 @@ async function runScenario(kind: ManagedKind, trigger: ExitTrigger) {
         listenersAfterDispose: number
       }
       : undefined
-    return { outcome, disposeCounts }
+    const spillPath = kind === 'spill'
+      ? (JSON.parse(await readFile(join(root, 'spill.json'), 'utf8')) as SpillState).spillPath
+      : undefined
+    return { outcome, disposeCounts, spillPath }
   } finally {
     if (!settled) {
       child.kill('SIGKILL')
@@ -167,5 +179,18 @@ describe('synchronous cleanup on host exit', () => {
     expect(outcome.exitCode).toBe(0)
     expect(disposeCounts?.listenersAfterLoad).toBe((disposeCounts?.listenersBefore ?? 0) + 1)
     expect(disposeCounts?.listenersAfterDispose).toBe(disposeCounts?.listenersBefore)
+  })
+
+  it('removes the private spill directory when a spilling host exits', { timeout: 45_000 }, async () => {
+    const { outcome, spillPath } = await runScenario('spill', 'direct')
+    expect(outcome.exitCode).toBe(23)
+    expect(outcome.signal).toBeUndefined()
+    expect(spillPath).toBeDefined()
+    // The exit-phase reclamation removes the whole per-process spill
+    // directory, spill file included — the sentinel for spill-file lifetime.
+    const spillDir = dirname(spillPath ?? '')
+    await vi.waitFor(async () => {
+      await expect(access(spillDir)).rejects.toThrowError()
+    }, { interval: 25, timeout: 10_000 })
   })
 })

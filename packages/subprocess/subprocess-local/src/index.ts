@@ -9,7 +9,7 @@
  */
 
 import { constants } from 'node:fs'
-import { access, stat } from 'node:fs/promises'
+import { access, rm, stat } from 'node:fs/promises'
 import { delimiter, extname, isAbsolute, resolve } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import * as nodePty from 'node-pty'
@@ -39,6 +39,14 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   private live = new Set<LocalSubprocessHandle>()
   /** Live terminals retained through normal quiescence or host-exit finalization. */
   private terminals = new Set<LocalTerminalHandle>()
+  /**
+   * Spill files this instance created and no consumer has removed yet. Spill
+   * paths stay advertised while their process runs (a background read may
+   * hand the path to the model), so per-command removal belongs to the
+   * consumer; disposal is this service's reclaim point, and process exit
+   * removes the whole private directory (see `spawn.ts`).
+   */
+  private readonly spillFiles = new Set<string>()
   /** Test hook: spill and platform knobs forwarded to spawnSubprocess. */
   internals: SpawnInternals = {}
   /** Test hook for platform process inspection; production resolves lazily on terminal spawn. */
@@ -97,8 +105,27 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
     if (failures.length > 0) this.terminateForHostExit()
     this.live.clear()
     this.terminals.clear()
+    await this.reclaimSpillFiles()
     if (failures.length === 1) throw failures[0]
     if (failures.length > 1) throw new AggregateError(failures, 'local subprocess teardown failed')
+  }
+
+  /**
+   * Unlink the spill files this instance created and no consumer removed.
+   * Best-effort: a file may already be gone (collector discard, a foreground
+   * handoff, or process exit) and disposal must not fail for reclamation.
+   */
+  private async reclaimSpillFiles(): Promise<void> {
+    const leftover = [...this.spillFiles]
+    this.spillFiles.clear()
+    await Promise.all(leftover.map(async (path) => {
+      try {
+        await rm(path)
+      } catch {
+        // Already reclaimed or externally removed — the goal (file gone)
+        // already holds, and one missing file must not fail the disposal.
+      }
+    }))
   }
 
   async resolveExecutable(
@@ -144,7 +171,15 @@ export class LocalSubprocessRuntime extends SubprocessRuntime {
   }
 
   spawn(spec: SubprocessSpawnSpec): SubprocessHandle {
-    const handle = spawnSubprocess(spec, this.internals)
+    // Track created spill files for disposal reclamation while forwarding the
+    // test hook, so a suite observing creations still sees every one.
+    const handle = spawnSubprocess(spec, {
+      ...this.internals,
+      onSpillFileCreated: (path) => {
+        this.spillFiles.add(path)
+        this.internals.onSpillFileCreated?.(path)
+      },
+    })
     this.live.add(handle)
     // Release ownership only once the whole TREE is gone, not at direct-child
     // settlement — a TERM-trapping helper that outlives the leader must stay

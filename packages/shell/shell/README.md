@@ -29,7 +29,7 @@ Use `ctx.shell` when an agent or an in-process plugin needs to run a shell comma
 
 ### Foreground commands
 
-Call `run` with a resolved spec to execute a command in the foreground. The promise resolves when the command finishes: a nonzero exit, an executor timeout kill, or a caller abort kill is a result, never a rejection. `run` rejects only for infrastructure failures such as an unusable working directory or a missing shell. The result carries the exit code or signal, whether a timeout or an abort cut the run short, and the collected stdout/stderr with spill-file paths when a stream overflowed its budget.
+Call `run` with a resolved spec to execute a command in the foreground. The promise resolves when the command finishes: a nonzero exit, an executor timeout kill, or a caller abort kill is a result, never a rejection. `run` rejects only for infrastructure failures such as an unusable working directory or a missing shell. The result carries the exit code or signal, whether a timeout or an abort cut the run short, and the collected stdout/stderr with spill-file paths when a stream overflowed its budget. When the request resolves spill ownership from the calling session, the executor persists an oversized stream into the owning session's spill store before `run()` resolves, so the result advertises that durable locator instead of a raw subprocess temp path; background processes keep their executor-managed spill paths until subprocess disposal.
 
 ```text
 const result = await ctx.shell.run(ctx.shell.resolve({ command: 'ls -la' }))

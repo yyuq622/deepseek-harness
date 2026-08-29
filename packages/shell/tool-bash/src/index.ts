@@ -23,7 +23,7 @@ import type { SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandb
 import { ESCALATION_TARGETS, approveEscalation, canonicalPath, validateEscalationArgs } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
 import { DSH_ENV_PREFIX } from '@deepseek-ai/dsh-shell'
-import type { ShellRunResult } from '@deepseek-ai/dsh-shell'
+import type { ShellRunResult, ShellSpillContext } from '@deepseek-ai/dsh-shell'
 import { processOutcome } from './background.ts'
 import { parseExitStatus, renderProcessRead, renderResult } from './render.ts'
 
@@ -153,6 +153,17 @@ function resolveWorkdir(
     return resolvePath(sessionCwd, modelWorkdir)
   }
   return modelWorkdir
+}
+
+/**
+ * Resolve foreground spill ownership from the calling session. An ownerless
+ * call (headless plugin consumers) leaves it undefined, keeping
+ * executor-managed spill files owned by subprocess disposal and process exit.
+ */
+function spillContextOf(exec: ToolExecution): ShellSpillContext | undefined {
+  const sessionId = exec.agent?.session.header.id
+  if (sessionId === undefined) return undefined
+  return { sessionId, toolName: exec.name, callId: exec.callId }
 }
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
@@ -339,12 +350,14 @@ export function apply(ctx: Context, config: Config = {}): void {
         : { ...(standingPolicy as SandboxExecutionPolicy), mode: approvedMode }
       const workdir = resolveWorkdir(args.workdir, exec, standingPolicy?.workspaceRoot)
       const dshEnv = ctx.shellEnv.collect(exec)
+      const spillContext = spillContextOf(exec)
       const request = {
         command: args.command,
         ...workdir !== undefined ? { workdir } : {},
         ...args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {},
         dshEnv,
         ...policy !== undefined ? { sandboxPolicy: policy } : {},
+        ...spillContext !== undefined ? { spillContext } : {},
       }
       if (args.run_in_background === true) {
         // Undeclared keys are allowed, so schema omission also needs enforcement.

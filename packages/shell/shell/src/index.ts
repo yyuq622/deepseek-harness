@@ -30,12 +30,15 @@ export type {
   ShellProcessStatus,
   ShellRunResult,
   ShellSandboxInfo,
+  ShellSpillContext,
   CollectedOutput,
   DshEnvironment,
   DshEnvironmentKey,
 } from './types.ts'
 export { parseExitStatus } from './render.ts'
 export type { ParsedExitStatus } from './render.ts'
+export { retainSpillOutput } from './spill.ts'
+export type { RetainSpillOutputParams } from './spill.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {

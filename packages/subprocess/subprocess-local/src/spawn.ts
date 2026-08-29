@@ -10,7 +10,7 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import type { Readable } from 'node:stream'
 import { randomBytes } from 'node:crypto'
-import { closeSync, mkdtempSync, openSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, mkdtempSync, openSync, rmSync, unlinkSync, writeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as sleepMs } from 'node:timers/promises'
@@ -56,6 +56,8 @@ export interface SpawnInternals {
   platform?: NodeJS.Platform
   /** Linux process-group member probe (defaults to `/proc` inspection). */
   linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined
+  /** Notified once per created spill file so the owning runtime can track and reclaim it on disposal. */
+  onSpillFileCreated?: (path: string) => void
 }
 
 /**
@@ -80,15 +82,49 @@ function sleepTick(): Promise<void> {
 
 let spillCounter = 0
 let defaultSpillDir: string | undefined
+let spillDirExitHookRegistered = false
 
 /**
  * The default spill location: a private (0700) per-process directory under
  * the OS tmpdir, created lazily. Predictable world-readable paths would let
  * other local users read command output or pre-create symlinks.
+ *
+ * Creating it also registers the process-exit reclamation hook once: spill
+ * files have no per-command disposal of their own (consumers read them
+ * through the advertised path, and a background read may advertise a path the
+ * model can still follow later), so the exit phase is the lifecycle boundary
+ * that must reclaim what disposal-era consumers did not.
  */
 function privateSpillDir(): string {
   defaultSpillDir ??= mkdtempSync(join(tmpdir(), 'dsh-subprocess-'))
+  if (!spillDirExitHookRegistered) {
+    spillDirExitHookRegistered = true
+    process.on('exit', removeProcessSpillDir)
+  }
   return defaultSpillDir
+}
+
+/**
+ * Remove this process's private spill directory. Registered as the process
+ * 'exit' hook and callable directly (the host-exit suite asserts the real
+ * removal); the lazy directory state resets so a later spawn recreates and
+ * keeps reclaiming.
+ */
+export function removeProcessSpillDir(): void {
+  const dir = defaultSpillDir
+  defaultSpillDir = undefined
+  /* v8 ignore next -- a reclaim after an earlier reclaim (manual, then the exit hook) already has no directory. */
+  if (dir === undefined) return
+  /* v8 ignore start -- a handle another process still holds open (Windows), a permission fault,
+     and a concurrent removal cannot be staged deterministically; reclamation stays best-effort. */
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch {
+    // Best-effort reclamation at shutdown: a handle another process still
+    // holds open (Windows) or a permission fault must not break the exit
+    // sequence; the next start-up finds at most one bounded-size directory.
+  }
+  /* v8 ignore stop */
 }
 
 /**
@@ -116,6 +152,7 @@ export class OutputCollector {
     private readonly maxSpillBytes: number | undefined,
     private readonly label: string,
     private readonly spillDir: string,
+    private readonly onSpillFileCreated?: (path: string) => void,
   ) {
     this.spillDisabled = maxSpillBytes === undefined
   }
@@ -167,6 +204,7 @@ export class OutputCollector {
         `dsh-subprocess-${process.pid}-${++spillCounter}-${randomBytes(6).toString('hex')}-${this.label}.log`,
       )
       this.spillFd = openSync(this.spillFile, 'wx', 0o600)
+      this.onSpillFileCreated?.(this.spillFile)
       for (const prior of this.chunks) writeSync(this.spillFd, prior)
     }
     writeSync(this.spillFd, chunk)
@@ -362,7 +400,7 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
 
   const collectStream = (mode: SubprocessOutputMode, stream: Readable | null, label: string): OutputCollector | undefined => {
     if (!isCollect(mode) || stream === null) return undefined
-    const collector = new OutputCollector(mode.maxBytes, mode.spill?.maxBytes, label, spillDir)
+    const collector = new OutputCollector(mode.maxBytes, mode.spill?.maxBytes, label, spillDir, internals.onSpillFileCreated)
     stream.on('data', (chunk: Buffer) => { collector.push(chunk) })
     return collector
   }

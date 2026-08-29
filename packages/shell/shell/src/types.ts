@@ -8,10 +8,28 @@
  */
 
 import type { SandboxEnforcement, SandboxExecutionPolicy, SandboxMode } from '@deepseek-ai/dsh-sandbox'
+import type { ToolCallId } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { CollectedOutput, DshEnvironment } from '@deepseek-ai/dsh-subprocess'
 
 export { DSH_ENV_PREFIX } from '@deepseek-ai/dsh-subprocess'
 export type { CollectedOutput, DshEnvironment, DshEnvironmentKey } from '@deepseek-ai/dsh-subprocess'
+
+/**
+ * Who owns one command's spill output, resolved by the tool layer from the
+ * calling session. Executors forward it to the spill handoff (see
+ * {@link retainSpillOutput}) so an oversized foreground result is persisted
+ * under the session's spill namespace with a durable model-facing locator
+ * instead of an unmanaged subprocess temp path.
+ */
+export interface ShellSpillContext {
+  /** The session whose spill namespace owns the artifacts. */
+  sessionId: SessionId
+  /** The tool whose result carries the output (audit metadata, e.g. `bash`). */
+  toolName: string
+  /** The model-issued call the output belongs to. */
+  callId: ToolCallId
+}
 
 /**
  * Sandbox facts for one run, present iff a sandboxing executor handled it.
@@ -76,6 +94,15 @@ export interface ShellExecRequest {
   dshEnv?: DshEnvironment | undefined
   /** Fully resolved per-call sandbox policy; sandboxing executors default it. */
   sandboxPolicy?: SandboxExecutionPolicy | undefined
+  /**
+   * Spill ownership for foreground output handoff, resolved by the tool layer
+   * from the calling session. Presenting executors persist an oversized
+   * foreground stream into the owning session's spill store before `run()`
+   * resolves, so the advertised spill path survives the command; absent (or on
+   * background processes, which keep executor-managed files until subprocess
+   * disposal) leaves the raw subprocess spill path in place.
+   */
+  spillContext?: ShellSpillContext | undefined
 }
 
 /**
@@ -107,6 +134,14 @@ export interface ShellExecSpec {
   dshEnv?: DshEnvironment | undefined
   /** Resolved sandbox policy; ignored by executors that do not confine. */
   sandboxPolicy: SandboxExecutionPolicy | undefined
+  /**
+   * Spill ownership carried through verbatim from
+   * {@link ShellExecRequest.spillContext} — no defaulting. Foreground
+   * executors use it to hand truncated output to the owning session's spill
+   * store; background processes ignore it (their spill files are
+   * executor-managed until subprocess disposal).
+   */
+  spillContext?: ShellSpillContext | undefined
 }
 
 /** The outcome of one completed (or killed) foreground run. */

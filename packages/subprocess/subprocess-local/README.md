@@ -87,7 +87,7 @@ A spawn builds the scrubbed child environment, starts the detached process, atta
 
 ### Safety invariants
 
-Spill files are opened `0600` with `O_EXCL` and random names under a `0700` per-process directory, defeating symlink planting in shared temp dirs; a failed final close withholds the spill path. Process identities carry start times, so cleanup never follows PID reuse. Host-exit finalization creates no promises or timers, preserves the host exit code and diagnostic, contains each target's failure, and does not claim quiescence.
+Spill files are opened `0600` with `O_EXCL` and random names under a `0700` per-process directory, defeating symlink planting in shared temp dirs; a failed final close withholds the spill path. Process identities carry start times, so cleanup never follows PID reuse. The runtime registers every spill file it creates, unlinks the ones still tracked during disposal, and the synchronous process-exit phase removes the whole private spill directory. Host-exit finalization creates no promises or timers, preserves the host exit code and diagnostic, contains each target's failure, and does not claim quiescence.
 
 </details>
 
@@ -127,7 +127,7 @@ These limits define when the provider is a poor fit or needs special operational
 - **A daemonized terminal descendant can still escape the observable boundary** — on macOS, a child that reparents before any foreground-inspection snapshot is no longer discoverable from the PTY root; on Linux, a `setsid` child leaves both the tree and the owned terminal session; the provider adds no continuous process-table monitor.
 - **In-process cleanup requires a JavaScript-observable exit** — direct `process.exit()`, default uncaught exceptions, and default unhandled rejections emit Node's synchronous `exit` event; an unhandled `SIGTERM`, `SIGINT`, or `SIGHUP`, `SIGKILL`, fatal OOM, `process.abort()`, native crashes, and power loss require an external supervisor, container init, or equivalent OS owner.
 - **The credential scrub is a name heuristic** — `*KEY*`/`*PASSWORD*`/`*SECRET*`/`*TOKEN*` only; differently named secrets (for example `*PASSPHRASE*`) pass through, and a whitelist for over-scrubbed variables is noted future work.
-- **Completed spill files are not deleted** — bounded full-output recovery files (and the private per-process spill directory) accumulate under the OS tmpdir until something external cleans them.
+- **Executor-managed spill files persist for the process lifetime** — background reads may advertise their paths at any moment, so files without a foreground spill-store handoff (background processes, ownership-free callers) are reclaimed at service disposal and the process-exit phase, not per command; the runtime's tracked-file registry grows by one entry per created spill file.
 
 <a id="dev-note"></a>
 ### Dev Note

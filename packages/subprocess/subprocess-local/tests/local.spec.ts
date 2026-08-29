@@ -1,6 +1,8 @@
 import { PassThrough } from 'node:stream'
+import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { describe, expect, it, vi } from 'vitest'
-import { basename, dirname, relative, resolve } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import type { SubprocessSpawnSpec, SubprocessTerminalHandle, SubprocessTerminalSpawnSpec } from '@deepseek-ai/dsh-subprocess'
@@ -29,6 +31,130 @@ function spec(command: string, overrides: Partial<SubprocessSpawnSpec> = {}): Su
 }
 
 describe('LocalSubprocessRuntime', () => {
+  it('reclaims tracked spill files during disposal', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    const service = ctx.subprocess as LocalSubprocessRuntime
+    const spillRoot = await mkdtemp(join(tmpdir(), 'dsh-subprocess-spill-reclaim-'))
+    service.internals = { spillDir: spillRoot }
+    try {
+      const handle = service.spawn(spec('sleep 60', {
+        argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(500))'],
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 10, spill: { maxBytes: 10_000 } },
+          stderr: { maxBytes: 10 },
+        },
+      }))
+      const outcome = await handle.done
+      expect(outcome.exitCode).toBe(0)
+      const read = handle.collected.stdout?.readFrom(0)
+      expect(read?.spillPath).toBeDefined()
+      expect(read?.lossy).toBe(true)
+
+      await fiber.dispose()
+      // The tracked file was removed with the service; the directory may
+      // still exist (process exit owns it) but holds no spill files.
+      const leftovers = await readdir(spillRoot)
+      expect(leftovers.filter(name => name.startsWith('dsh-subprocess-'))).toEqual([])
+    } finally {
+      await rm(spillRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('retains one spill file per over-limit command and reclaims all of them at disposal', async () => {
+    // The sentinel for the accumulation leak: N over-limit commands may hold
+    // N spill files while their paths stay advertised, and disposal leaves zero.
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    const service = ctx.subprocess as LocalSubprocessRuntime
+    const spillRoot = await mkdtemp(join(tmpdir(), 'dsh-subprocess-spill-sentinel-'))
+    service.internals = { spillDir: spillRoot }
+    try {
+      const paths: string[] = []
+      for (let run = 0; run < 3; run += 1) {
+        const handle = service.spawn(spec('sleep 60', {
+          argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(500))'],
+          stdio: {
+            stdin: 'ignore',
+            stdout: { maxBytes: 10, spill: { maxBytes: 10_000 } },
+            stderr: { maxBytes: 10 },
+          },
+        }))
+        const outcome = await handle.done
+        expect(outcome.exitCode).toBe(0)
+        const read = handle.collected.stdout?.readFrom(0)
+        expect(read?.spillPath).toBeDefined()
+        paths.push(read!.spillPath!)
+      }
+      // Between commands the files stay (an advertised path must remain
+      // resolvable), so the allowed count is exactly the number of runs.
+      const retained = (await readdir(spillRoot)).filter(name => name.startsWith('dsh-subprocess-')).sort()
+      expect(retained).toEqual(paths.map(path => basename(path)).sort())
+
+      await fiber.dispose()
+      const leftovers = await readdir(spillRoot)
+      expect(leftovers.filter(name => name.startsWith('dsh-subprocess-'))).toEqual([])
+    } finally {
+      await rm(spillRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('disposal tolerates a spill file that was removed before reclamation', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    const service = ctx.subprocess as LocalSubprocessRuntime
+    const spillRoot = await mkdtemp(join(tmpdir(), 'dsh-subprocess-spill-external-'))
+    service.internals = { spillDir: spillRoot }
+    try {
+      const handle = service.spawn(spec('sleep 60', {
+        argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(500))'],
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 10, spill: { maxBytes: 10_000 } },
+          stderr: { maxBytes: 10 },
+        },
+      }))
+      await handle.done
+      const read = handle.collected.stdout?.readFrom(0)
+      expect(read?.spillPath).toBeDefined()
+      // The foreground handoff removes the raw file after persisting it; the
+      // runtime's registry entry then points at a path that is already gone.
+      await rm(read!.spillPath!)
+
+      await fiber.dispose()
+      const leftovers = await readdir(spillRoot)
+      expect(leftovers.filter(name => name.startsWith('dsh-subprocess-'))).toEqual([])
+    } finally {
+      await rm(spillRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('notifies the owner of every created spill file through the internals hook', async () => {
+    const ctx = new Context()
+    const fiber = await ctx.plugin(LocalSubprocessRuntime)
+    const service = ctx.subprocess as LocalSubprocessRuntime
+    const spillRoot = await mkdtemp(join(tmpdir(), 'dsh-subprocess-spill-hook-'))
+    const created: string[] = []
+    service.internals = { spillDir: spillRoot, onSpillFileCreated: path => { created.push(path) } }
+    try {
+      const handle = service.spawn(spec('sleep 60', {
+        argv: [process.execPath, '-e', 'process.stdout.write("x".repeat(500))'],
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 10, spill: { maxBytes: 10_000 } },
+          stderr: { maxBytes: 10 },
+        },
+      }))
+      await handle.done
+      expect(created).toHaveLength(1)
+      expect(created[0]).toContain(join(spillRoot, 'dsh-subprocess-'))
+    } finally {
+      await fiber.dispose()
+      await rm(spillRoot, { recursive: true, force: true })
+    }
+  })
+
   it('places the host-exit finalizer before listeners that predate the service', async () => {
     const baseline = new Set(process.listeners('exit'))
     const prior = vi.fn()
