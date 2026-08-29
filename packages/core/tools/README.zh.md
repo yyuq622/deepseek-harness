@@ -107,7 +107,8 @@ ctx.tools.register(defineTool({
 | 文件 | 职责 |
 |---|---|
 | [`src/index.ts`](src/index.ts) | 插件入口：`ToolRuntime` 服务、配置、注册表、执行流水线 |
-| [`src/types.ts`](src/types.ts) | `ToolDefinition`、`ToolExecution`、`ToolExecutionResult`、守卫与决策类型 |
+| [`src/definitions.ts`](src/definitions.ts) | 公共契约词汇：工具与执行形态、流水线决策、规范代码与错误、共享快照辅助 |
+| [`src/types.ts`](src/types.ts) | 持久化 `tool/code-dispatch` 事件 payload 类型 |
 | [`src/schema.ts`](src/schema.ts) | `defineTool` DSL：`ValueSchemaSpec`、`ParameterSchemaSpec`、`InferValue`、`InferArgs` |
 | [`src/json-schema.ts`](src/json-schema.ts) | 强制执行的原始 JSON Schema 子集与校验 |
 | [`src/presentation.ts`](src/presentation.ts) | 带 `card` 标签的 UI 呈现意图 |
