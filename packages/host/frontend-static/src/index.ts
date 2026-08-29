@@ -6,15 +6,18 @@
  * unknown extensions ship as octet-stream, and non-GET/HEAD is 405. Every
  * index response first passes Connection's browser authentication, then the
  * webserver's index render (structured injection rows, then raw taps).
- * Non-index assets stay public. The dist location is workspace knowledge of
+ * Non-index assets stay public. A link planted inside the dist cannot serve a
+ * file outside it: file targets are resolved to their final location with
+ * `realpath` and re-verified against the real root before any bytes move. The
+ * dist location is workspace knowledge of
  * the composing application, so `distIndex` is typically supplied through a
  * `!!js` expression, never hardcoded by a deployment.
  * @module @deepseek-ai/dsh-host-frontend-static
  */
 
 import type { ServerResponse } from 'node:http'
-import { readFile } from 'node:fs/promises'
-import { dirname, extname, join, normalize, resolve, sep } from 'node:path'
+import { readFile, realpath, realpathSync } from 'node:fs/promises'
+import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -59,10 +62,22 @@ const STATIC_MISS_CODES: ReadonlySet<string | undefined> = new Set([
 ])
 
 /**
+ * Whether `target` is `root` itself or stays beneath it. Path case folds on
+ * Windows, where realpath reports on-disk casing that can differ from the
+ * casing the dist root was configured with.
+ */
+function underRoot(target: string, root: string): boolean {
+  const fold = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value
+  const targetPath = fold(target)
+  const rootPath = fold(root)
+  return targetPath === rootPath || targetPath.startsWith(rootPath + sep)
+}
+
+/**
  * Serve one GET/HEAD static request from the dist root.
  * @param pathname - decoded URL pathname of the request.
  * @param res - the node:http response to write.
- * @param distRoot - absolute dist root directory (resolved by the caller).
+ * @param distRoot - the dist root's realpath (resolved once by the caller at activation).
  * @param distIndex - absolute path of index.html inside distRoot.
  * @param authorizeIndex - authenticates an index response before its bytes are read.
  * @param renderIndex - produces the index.html body (structured injection
@@ -74,10 +89,10 @@ export async function serveStatic(
   renderIndex: () => Promise<string>,
 ): Promise<void> {
   const target = resolve(normalize(join(distRoot, pathname)))
-  // Traversal rejection: the target must be distRoot itself (`/`) or stay under
-  // it. `sep`, not '/': resolve() emits backslash paths on Windows, where a '/'
-  // suffix would reject every legitimate subpath as traversal.
-  if (target !== distRoot && !target.startsWith(distRoot + sep)) {
+  // Traversal rejection (lexical): the target must be distRoot itself (`/`) or
+  // stay under it. `sep`, not '/': resolve() emits backslash paths on Windows,
+  // where a '/' suffix would reject every legitimate subpath as traversal.
+  if (!underRoot(target, distRoot)) {
     res.writeHead(403)
     res.end()
     return
@@ -90,8 +105,19 @@ export async function serveStatic(
       body = await renderIndex()
       type = HTML_MIME
     } else {
-      body = await readFile(target)
-      type = MIME[extname(target)] ?? 'application/octet-stream'
+      // readFile follows symlinks and junctions, so resolve the target to its
+      // final location and re-verify containment against the real root before
+      // any bytes are read — a link planted inside the dist cannot serve a
+      // file outside it. Windows realpath reports on-disk casing, which the
+      // containment compare folds.
+      const resolved = await realpath(target)
+      if (!underRoot(resolved, distRoot)) {
+        res.writeHead(403)
+        res.end()
+        return
+      }
+      body = await readFile(resolved)
+      type = MIME[extname(resolved)] ?? 'application/octet-stream'
     }
   } catch (error) {
     // Only absent or non-file targets are 404; other filesystem failures reach
@@ -112,7 +138,12 @@ export async function serveStatic(
  */
 export function apply(ctx: Context, config: Config): void {
   const distIndex = config.distIndex
-  const distRoot = dirname(distIndex)
+  // One activation-time resolution: the served root is the dist directory's
+  // real location, so a symlinked install path cannot break the containment
+  // compares and the SPA index anchors to the same real root. A missing dist
+  // fails loud at load instead of at first request.
+  const distRoot = realpathSync(dirname(distIndex))
+  const distIndexReal = join(distRoot, basename(distIndex))
   // The dist is built with a relative base so the same files mount under any
   // static directory; served pages also answer deep SPA-fallback paths, where
   // relative asset URLs would resolve under the request directory, so the
@@ -135,7 +166,7 @@ export function apply(ctx: Context, config: Config): void {
       decodeURIComponent(rawPath),
       res,
       distRoot,
-      distIndex,
+      distIndexReal,
       () => ctx.connection.authorizeIndex(req, res),
       renderIndex,
     )

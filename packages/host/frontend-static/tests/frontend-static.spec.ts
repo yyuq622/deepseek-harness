@@ -6,7 +6,7 @@
  * GET/HEAD, and seat release on fiber disposal (HMR safety).
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -204,5 +204,21 @@ describe('real Loader composition', () => {
     await frontendEntry!.fiber?.dispose()
     expect((await request(port, '/no/such/route')).status).toBe(404)
     expect(() => server.registerFallback(() => {})).not.toThrow()
+  })
+
+  it('rejects a link inside the dist that resolves outside it', { timeout: 60_000 }, async () => {
+    const loaded = await loadComposition()
+    const server = loaded.webServer
+    const secretDir = join(root!, 'secret')
+    await mkdir(secretDir)
+    await writeFile(join(secretDir, 'secret.txt'), 'TOPSECRET')
+    const link = join(root!, 'dist', 'escape')
+    // Junctions need no Windows privilege and resolve through realpath like
+    // symlinks, so the fence is exercised on every platform.
+    await symlink(secretDir, link, process.platform === 'win32' ? 'junction' : undefined)
+
+    // A legitimate file still serves; the escaping link does not.
+    expect((await request(server.port, '/app.js')).status).toBe(200)
+    expect((await request(server.port, '/escape/secret.txt')).status).toBe(403)
   })
 })
