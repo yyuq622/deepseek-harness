@@ -37,11 +37,17 @@ function fakeContext(secret = 'fixture-secret'): {
 }
 
 /** Start a real Node server around the package-owned route handler. */
-async function serve(ctx: Context, maxBodyBytes = 1024): Promise<string> {
+async function serve(
+  ctx: Context,
+  maxBodyBytes = 1024,
+  rateLimit: { capacity: number; refillPerSecond: number } = { capacity: 30, refillPerSecond: 10 },
+): Promise<string> {
   const handler = createGitHubWebhookHandler(ctx, {
     source: 'primary',
     secretEnv: credentialRef('DSH_GITHUB_WEBHOOK_SECRET'),
     maxBodyBytes,
+    rateLimitCapacity: rateLimit.capacity,
+    rateLimitRefillPerSecond: rateLimit.refillPerSecond,
   })
   const server = createServer((request, response) => { void handler(request, response) })
   servers.push(server)
@@ -254,5 +260,45 @@ describe('GitHub webhook HTTP handler', () => {
     const diagnostics = JSON.stringify(fake.warnings.mock.calls)
     expect(diagnostics).not.toContain('super-secret')
     expect(diagnostics).not.toContain('payload-secret')
+  })
+
+  it('rate limits a flood from one source after the bucket drains', async () => {
+    const fake = fakeContext()
+    const base = await serve(fake.ctx, 1024, { capacity: 2, refillPerSecond: 1 })
+    const statuses: number[] = []
+    for (let index = 1; index <= 3; index += 1) {
+      statuses.push((await post(base, '{}', { delivery: `flood-${index}` })).status)
+    }
+    expect(statuses).toEqual([202, 202, 429])
+    expect(fake.dispatch).toHaveBeenCalledTimes(2)
+  })
+
+  it('answers a redelivered delivery id with 202 without re-invoking rules', async () => {
+    const fake = fakeContext()
+    const base = await serve(fake.ctx)
+    const body = JSON.stringify({ ping: true })
+    expect((await post(base, body, { delivery: 'same-id' })).status).toBe(202)
+    expect((await post(base, body, { delivery: 'same-id' })).status).toBe(202)
+    expect(fake.dispatch).toHaveBeenCalledOnce()
+  })
+
+  it('opens the breaker after ten consecutive signature failures and resets on success', async () => {
+    const fake = fakeContext()
+    const base = await serve(fake.ctx)
+    // Nine failures stay below the threshold; a success resets the streak.
+    for (let index = 0; index < 9; index += 1) {
+      expect((await post(base, '{}', { signature: 'sha256=bad', delivery: `bad-${index}` })).status).toBe(401)
+    }
+    expect((await post(base, '{}', { delivery: 'good-1' })).status).toBe(202)
+    expect((await post(base, '{}', { signature: 'sha256=bad', delivery: 'bad-after-good' })).status).toBe(401)
+    expect((await post(base, '{}', { delivery: 'good-2' })).status).toBe(202)
+    // Ten consecutive failures open the breaker: even a valid signature is
+    // rejected without HMAC work until the cooldown elapses.
+    for (let index = 0; index < 10; index += 1) {
+      expect((await post(base, '{}', { signature: 'sha256=bad', delivery: `burst-${index}` })).status).toBe(401)
+    }
+    expect((await post(base, '{}', { delivery: 'during-breaker' })).status).toBe(503)
+    const dispatchedIds = fake.dispatch.mock.calls.map(call => (call[0] as { deliveryId: string }).deliveryId)
+    expect(dispatchedIds).toEqual(['good-1', 'good-2'])
   })
 })

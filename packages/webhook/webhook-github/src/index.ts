@@ -23,6 +23,10 @@ export interface Config {
   readonly secretEnv: string
   /** Positive raw body ceiling in bytes. */
   readonly maxBodyBytes: number
+  /** Burst capacity of the per-source ingress token bucket. */
+  readonly rateLimitCapacity?: number
+  /** Tokens refilled per second, per source address. */
+  readonly rateLimitRefillPerSecond?: number
 }
 
 export const Config: z<Config> = z.object({
@@ -30,6 +34,8 @@ export const Config: z<Config> = z.object({
   path: z.string().required(),
   secretEnv: z.string().role('credential-ref').required(),
   maxBodyBytes: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).required(),
+  rateLimitCapacity: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(30),
+  rateLimitRefillPerSecond: z.number().min(0.1).max(Number.MAX_SAFE_INTEGER).default(10),
 })
 
 /** Validate route and source facts that Schemastery cannot express. */
@@ -53,6 +59,8 @@ export function apply(ctx: Context, config: Config): void {
       source: config.source,
       secretEnv: credentialRef(config.secretEnv),
       maxBodyBytes: config.maxBodyBytes,
+      rateLimitCapacity: config.rateLimitCapacity,
+      rateLimitRefillPerSecond: config.rateLimitRefillPerSecond,
     }),
   }
   ctx.effect(

@@ -12,6 +12,7 @@ import {
 } from '@deepseek-ai/dsh-webhook'
 import type { WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import { readBoundedUtf8Body, WebhookHttpError } from './body.ts'
+import { WebhookIngressGuard } from './ingress.ts'
 import type { GitHubJsonObject } from './types.ts'
 
 /** Handler values validated once at plugin load. */
@@ -19,6 +20,23 @@ export interface GitHubWebhookHandlerConfig {
   readonly source: string
   readonly secretEnv: CredentialRef
   readonly maxBodyBytes: number
+  /** Burst capacity of the per-source ingress token bucket. */
+  readonly rateLimitCapacity: number
+  /** Tokens refilled per second, per source address. */
+  readonly rateLimitRefillPerSecond: number
+}
+
+/**
+ * Create one instance of the ingress guard: the token bucket is traffic
+ * policy from plugin config; the breaker and idempotency bounds are the
+ * guard's fixed constants.
+ */
+function createIngressGuard(config: GitHubWebhookHandlerConfig): WebhookIngressGuard {
+  return new WebhookIngressGuard({
+    capacity: config.rateLimitCapacity,
+    refillPerSecond: config.rateLimitRefillPerSecond,
+    now: Date.now,
+  })
 }
 
 /** Require one unambiguous non-empty request header. */
@@ -79,7 +97,9 @@ export function createGitHubWebhookHandler(
   ctx: Context,
   config: GitHubWebhookHandlerConfig,
 ): WebRoute['handler'] {
+  const guard = createIngressGuard(config)
   return async (request, response) => {
+    const source = request.socket.remoteAddress ?? 'unknown'
     try {
       if (request.method !== 'POST') {
         response.setHeader('allow', 'POST')
@@ -87,6 +107,15 @@ export function createGitHubWebhookHandler(
       }
       if (!isJsonContentType(request.headers['content-type'])) {
         throw new WebhookHttpError(415, 'content type must be application/json')
+      }
+      // The bucket is consumed before any body work: a flood pays nothing
+      // beyond the cheap header checks. 429 preempts the body's 413 only for
+      // an empty bucket; the 413 semantics themselves are unchanged.
+      if (!guard.consume(source)) {
+        throw new WebhookHttpError(429, 'webhook ingress rate limit exceeded')
+      }
+      if (guard.isBroken(source)) {
+        throw new WebhookHttpError(503, 'webhook ingress temporarily unavailable')
       }
       const body = await readBoundedUtf8Body(request, config.maxBodyBytes)
       const signature = requiredHeader(request, 'x-hub-signature-256')
@@ -102,7 +131,19 @@ export function createGitHubWebhookHandler(
       } catch {
         // Octokit verification errors carry no response detail safe or useful to the sender.
       }
-      if (!verified) throw new WebhookHttpError(401, 'invalid webhook signature')
+      if (!verified) {
+        guard.recordVerificationFailure(source)
+        throw new WebhookHttpError(401, 'invalid webhook signature')
+      }
+      guard.recordVerificationSuccess(source)
+      if (guard.isKnownDelivery(deliveryId)) {
+        // GitHub redelivers on timeout: an already dispatched id is answered
+        // 202 without re-invoking rules (idempotent short-circuit). The id
+        // was recorded after the original dispatch, so a failed dispatch
+        // stays retryable.
+        respond(response, 202)
+        return
+      }
       const payload = parsePayload(body)
       const delivery: VerifiedWebhookDelivery<'github'> = {
         kind: 'github',
@@ -117,6 +158,7 @@ export function createGitHubWebhookHandler(
         ctx.logger.warn('webhook-github: dispatch unavailable')
         throw new WebhookHttpError(503, 'webhook runtime is unavailable')
       }
+      guard.recordDelivery(deliveryId)
       respond(response, 202)
     } catch (error: unknown) {
       if (error instanceof WebhookHttpError) {

@@ -31,8 +31,10 @@ English | [中文](README.zh.md)
 | `path` | Exact non-root pathname without trailing slash, query, or fragment. |
 | `secretEnv` | Credential reference containing the GitHub webhook secret. |
 | `maxBodyBytes` | Positive safe-integer ceiling for the untouched request body. |
+| `rateLimitCapacity` | Burst capacity of the per-source ingress token bucket (default 30). |
+| `rateLimitRefillPerSecond` | Tokens refilled per second, per source address (default 10). |
 
-All fields are required. The secret reference is resolved for every request, so rotation affects the next delivery without reloading the plugin.
+The first four fields are required. The secret reference is resolved for every request, so rotation affects the next delivery without reloading the plugin.
 
 <a id="http-contract"></a>
 ## HTTP contract
@@ -41,13 +43,16 @@ Only `POST application/json` is accepted. The adapter reads a bounded UTF-8 body
 
 | Status | Meaning |
 |---|---|
-| `202` | Verified JSON was dispatched in memory. |
+| `202` | Verified JSON was dispatched in memory — or the `X-GitHub-Delivery` id was already dispatched (idempotent redelivery answer, no rules re-invoked). |
 | `400` | Required header, UTF-8, JSON, or top-level object was invalid. |
 | `401` | Signature was invalid. |
 | `405` | Method was not `POST`. |
 | `413` | Declared or streamed body exceeded `maxBodyBytes`. |
 | `415` | Media type was not `application/json`. |
-| `503` | Credential or webhook runtime was unavailable. |
+| `429` | The source address's ingress token bucket was empty. |
+| `503` | Credential or webhook runtime was unavailable, or the source's failure breaker was open. |
+
+Ingress guarding is in-memory and per handler instance: requests from one source address share a token bucket (`rateLimitCapacity` burst, `rateLimitRefillPerSecond` refill), ten consecutive signature failures open a ten-second breaker that rejects the source without HMAC work, and the last 1000 dispatched delivery ids are answered idempotently.
 
 `202` does not state that any rule matched or that a Session was created. GitHub event-specific field validation belongs to each rule; the adapter guarantees only authenticated generic JSON.
 

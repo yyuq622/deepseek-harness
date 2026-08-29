@@ -31,8 +31,10 @@ kind: "package-reference"
 | `path` | 不带尾随斜杠、查询或片段的精确非根路径。 |
 | `secretEnv` | 包含 GitHub webhook 密钥的凭据引用。 |
 | `maxBodyBytes` | 未改动请求 body 的正安全整数上限。 |
+| `rateLimitCapacity` | 每源地址入口令牌桶的突发容量（默认 30）。 |
+| `rateLimitRefillPerSecond` | 每源地址每秒补充的令牌数（默认 10）。 |
 
-所有字段均为必填。每次请求都会重新解析密钥引用，因此轮换会在下一次交付生效，而无需重新加载插件。
+前四个字段为必填。每次请求都会重新解析密钥引用，因此轮换会在下一次交付生效，而无需重新加载插件。
 
 <a id="http-contract"></a>
 ## HTTP 约定
@@ -41,13 +43,16 @@ kind: "package-reference"
 
 | 状态 | 含义 |
 |---|---|
-| `202` | 已验证 JSON 已在内存中分发。 |
+| `202` | 已验证 JSON 已在内存中分发——或该 `X-GitHub-Delivery` id 已经分发过（幂等的重交付应答，不重新调用规则）。 |
 | `400` | 必需 header、UTF-8、JSON 或顶层对象无效。 |
 | `401` | 签名无效。 |
 | `405` | 方法不是 `POST`。 |
 | `413` | 声明或流式 body 超过 `maxBodyBytes`。 |
 | `415` | media type 不是 `application/json`。 |
-| `503` | 凭据或 webhook runtime 不可用。 |
+| `429` | 该源地址的入口令牌桶已空。 |
+| `503` | 凭据或 webhook runtime 不可用，或该源地址的失败熔断器处于打开状态。 |
+
+入口防护按 handler 实例保存在内存中：同一源地址的请求共享一个令牌桶（`rateLimitCapacity` 突发、`rateLimitRefillPerSecond` 补充），连续十次签名失败会打开十秒熔断器，使该源地址不经 HMAC 工作即被拒绝；最近 1000 个已分发的 delivery id 会被幂等应答。
 
 `202` 不表示任何规则已经匹配，也不表示已创建 Session。GitHub 事件特定字段的验证属于各规则；适配器只保证通过身份验证的通用 JSON。
 
