@@ -1,9 +1,10 @@
 /**
  * Process plumbing for the local subprocess service: detached process-tree
  * spawn with per-stream stdio dispositions, tail-keep collection with spill
- * files, tree-scoped signalling (POSIX groups; Windows taskkill), and the
- * SIGTERM→SIGKILL escalation. This layer reacts to an abort signal; callers
- * own deadlines, teardown ladders, and cause classification.
+ * files, tree-scoped signalling (POSIX process groups; identity-fenced
+ * Windows tree sweeps), and the SIGTERM→SIGKILL escalation. This layer
+ * reacts to an abort signal; callers own deadlines, teardown ladders, and
+ * cause classification.
  * @module dsh-subprocess-local/spawn
  */
 
@@ -25,6 +26,8 @@ import type {
   SubprocessSpawnSpec,
 } from '@deepseek-ai/dsh-subprocess'
 import { linuxProcessGroupHasLiveMembers } from './process-inspector.ts'
+import { defaultWindowsTreeSweep } from './windows-inspector.ts'
+import type { WindowsTreeSweep } from './windows-inspector.ts'
 
 /**
  * Build a child environment: explicit caller entries override the scrubbed
@@ -58,6 +61,13 @@ export interface SpawnInternals {
   linuxProcessGroupHasLiveMembers?: (processGroupId: number) => boolean | undefined
   /** Notified once per created spill file so the owning runtime can track and reclaim it on disposal. */
   onSpillFileCreated?: (path: string) => void
+  /**
+   * Identity-fenced Windows tree termination. Defaults to the real sweep on a
+   * Windows host and stays undefined elsewhere (the win32 kill path then uses
+   * the legacy pid-targeted fallback); tests inject fakes to pin the sweep
+   * contract on any host.
+   */
+  win32TreeSweep?: WindowsTreeSweep
 }
 
 /**
@@ -320,22 +330,12 @@ export function taskkillProcessTree(pid: number): void {
 }
 
 /**
- * Signal a detached process tree with platform-correct semantics: POSIX
- * signals the negative process-group id and falls back to the direct child
- * when the group is gone; Windows terminates the tree via taskkill (any
- * signal value force-terminates — Node maps signals to TerminateProcess).
+ * Signal a detached POSIX process group, falling back to the direct child
+ * when the group is gone. Windows never reaches here: its kill path is the
+ * identity-fenced sweep (see {@link WindowsTreeSweep}), which also reaches
+ * the descendants of a root that exited on its own.
  */
-function signalTree(
-  platform: NodeJS.Platform,
-  pid: number,
-  sig: NodeJS.Signals,
-  child: ChildProcess,
-  taskkill: (pid: number) => void,
-): void {
-  if (platform === 'win32') {
-    taskkill(pid)
-    return
-  }
+function signalTree(pid: number, sig: NodeJS.Signals, child: ChildProcess, taskkill: (pid: number) => void): void {
   /* v8 ignore next -- kill/terminate gate on treeAlive(), which is false for pid -1; this guard protects direct callers only. */
   if (pid <= 0) return
   try {
@@ -415,6 +415,15 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
   // Failed spawns use pid -1 so signalling remains a no-op.
   const pid = child.pid ?? -1
 
+  // The root's creation-time identity fences every Windows termination
+  // decision against pid reuse; capture fails soft — an unreadable identity
+  // falls back to pid-targeted termination of a live root.
+  const win32TreeSweep = internals.win32TreeSweep ?? defaultWindowsTreeSweep()
+  /* v8 ignore next 3 -- a win32-injected failed spawn (pid -1) is not staged; the guard keeps the capture off non-positive pids. */
+  const rootIdentity = platform === 'win32' && pid > 0
+    ? win32TreeSweep?.captureRootIdentity(pid)
+    : undefined
+
   /** Whether the detached tree's root (or POSIX group) is still alive. */
   const treeAlive = (): boolean => {
     /* v8 ignore next -- only a timer callback already queued when the observer settles can enter here;
@@ -423,7 +432,9 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
     if (pid <= 0) return false
     if (platform === 'win32') {
       // Windows has no group-liveness probe; the direct child's exit is the
-      // observable boundary (taskkill /T already took the tree with it).
+      // wait boundary. Surviving descendants of an exited root are the
+      // termination sweep's job (see `win32TerminateTier`), never this
+      // probe's — reaping from a liveness question would surprise callers.
       return child.exitCode === null && child.signalCode === null
     }
     try {
@@ -449,44 +460,82 @@ export function spawnSubprocess(spec: SubprocessSpawnSpec, internals: SpawnInter
 
   /**
    * Start or reuse the handle's single whole-tree exit observer. The first
-   * confirmed absence is a permanent no-more-signals boundary: it cancels a
-   * pending escalation before this process-group id can be reused.
+   * confirmed absence is a permanent no-more-signals boundary. On POSIX it
+   * also cancels a pending escalation before the group id can be reused; on
+   * Windows, where the direct child's exit is not tree absence, releasing the
+   * escalation requires a read-only scan that finds nothing left to reach.
    */
   const observeTreeExit = (): Promise<void> => {
     treeExitObservation ??= (async () => {
       while (treeAlive()) await sleepTick()
       treeExitObserved = true
+      if (platform === 'win32') {
+        // The direct child's exit is not tree absence on Windows — descendants
+        // keep their parent links. Only a read-only scan that finds no live
+        // root and no surviving descendant releases the SIGKILL escalation and
+        // the ref'd event-loop handle it keeps; the wait path never terminates.
+        if (win32TreeSweep?.hasLiveWork(pid, rootIdentity) !== true && graceTimer !== undefined) {
+          clearTimeout(graceTimer)
+          graceTimer = undefined
+        }
+        return
+      }
       if (graceTimer !== undefined) clearTimeout(graceTimer)
       graceTimer = undefined
     })()
     return treeExitObservation
   }
 
+  // One Windows termination tier: the identity-fenced sweep, or — when no
+  // sweep is available (a non-Windows host running win32-semantics tests) —
+  // the legacy pid-targeted guard. Any Windows signal force-terminates, so
+  // the signal value never reaches this tier.
+  const win32TerminateTier = (): boolean => {
+    if (win32TreeSweep !== undefined) return win32TreeSweep.sweep(pid, rootIdentity)
+    if (treeAlive()) {
+      taskkill(pid)
+      return true
+    }
+    return false
+  }
+
   // The escalation's tier primitive (not on the handle — terminate() is the
-  // only consumer-facing termination verb). Guards on TREE liveness, not
-  // outcome settlement: a TERM-trapping helper can outlive the settled direct
-  // child and must stay signalable, while a fully-dead tree (possible pid
-  // reuse) must not be re-signalled by a later tier.
+  // only consumer-facing termination verb). POSIX guards on TREE liveness,
+  // not outcome settlement: a TERM-trapping helper can outlive the settled
+  // direct child and must stay signalable, while a fully-dead group (possible
+  // pid reuse) must not be re-signalled by a later tier. Windows termination
+  // is identity-fenced instead, so it also reaches the descendants of a root
+  // that exited on its own.
   const kill = (sig: NodeJS.Signals): void => {
+    if (platform === 'win32') {
+      win32TerminateTier()
+      return
+    }
     /* v8 ignore next -- the shared exit observer cancels the ordinary dead-tree timer;
        this remains the timer/death race guard and cannot be staged deterministically. */
     if (!treeAlive()) return
-    signalTree(platform, pid, sig, child, taskkill)
+    signalTree(pid, sig, child, taskkill)
   }
 
   const terminate = (): void => {
-    if (treeExitObserved || graceTimer !== undefined) return
+    if (graceTimer !== undefined) return
+    if (platform === 'win32') {
+      // Tier 1 IS the sweep. Arming follows its outcome: a sweep that
+      // terminated something keeps the SIGKILL re-sweep committed, and one
+      // that found nothing alive — or a reused root pid — leaves nothing to
+      // escalate. The timer stays ref'd: the pending re-sweep is a
+      // commitment, and a parent exiting before it fires would leave the
+      // reaped-orphan race window unguarded. Self-bounds at graceMs.
+      if (!win32TerminateTier()) return
+      graceTimer = setTimeout(() => { win32TerminateTier() }, spec.graceMs)
+      return
+    }
     // Observe from the first termination tier onward, even when inherited
     // pipes delay `done` and no consumer has begun its own teardown wait.
     void observeTreeExit()
     // oxlint-disable-next-line typescript/no-unnecessary-condition -- observer can record absence before its first await.
     if (treeExitObserved) return
     kill('SIGTERM')
-    // The escalation must survive direct-child settlement — the leader dying
-    // does not mean the tree died — so settle does not clear this timer, and
-    // kill() re-probes tree liveness before force-killing. It stays ref'd:
-    // the pending SIGKILL is a commitment, and a parent exiting before it
-    // fires would orphan a trapped survivor. Self-bounds at graceMs.
     graceTimer = setTimeout(() => { kill('SIGKILL') }, spec.graceMs)
   }
 

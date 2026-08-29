@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, statSync, unlinkSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -705,6 +705,137 @@ describe('windows tree semantics (injected platform)', () => {
     const running = spawnSubprocess(spec('true'), { spillDir, platform: 'win32', taskkill: () => {} })
     await running.done
     await expect(running.waitForExit()).resolves.toBe(true)
+  })
+})
+
+describe('windows tree sweep wiring (injected sweep)', () => {
+  it('captures the root identity at spawn and sweeps at both termination tiers', async () => {
+    const sweeps: Array<{ pid: number; identity: string | undefined }> = []
+    let captured: number | undefined
+    const running = spawnSubprocess(spec('sleep 60', { graceMs: 50 }), {
+      spillDir,
+      platform: 'win32',
+      win32TreeSweep: {
+        captureRootIdentity: (rootPid) => { captured = rootPid; return 'root-identity' },
+        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return true },
+        hasLiveWork: () => true,
+      },
+    })
+    expect(captured).toBe(running.pid)
+
+    running.terminate()
+    expect(sweeps).toEqual([{ pid: running.pid, identity: 'root-identity' }])
+    // The escalation re-sweeps once after the grace period.
+    await vi.waitFor(() => expect(sweeps).toHaveLength(2))
+
+    // Observing while the root still runs keeps the escalation armed and
+    // never terminates from the wait path.
+    const waited = running.waitForExit()
+    try {
+      process.kill(running.pid, 'SIGKILL')
+    } catch {
+      // Already gone.
+    }
+    await running.done
+    await expect(waited).resolves.toBe(true)
+    // The wait path never terminates: only the two termination tiers swept.
+    expect(sweeps).toHaveLength(2)
+  })
+
+  it('does not arm the escalation when the sweep reports a fully absent tree', async () => {
+    const sweeps: Array<{ pid: number; identity: string | undefined }> = []
+    const running = spawnSubprocess(spec('sleep 60', { graceMs: 40 }), {
+      spillDir,
+      platform: 'win32',
+      win32TreeSweep: {
+        captureRootIdentity: () => 'root-identity',
+        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return false },
+        hasLiveWork: () => false,
+      },
+    })
+    running.terminate()
+    expect(sweeps).toHaveLength(1)
+    // Three grace periods: the escalation must never arm for an absent tree.
+    await new Promise(resolve => setTimeout(resolve, 120))
+    expect(sweeps).toHaveLength(1)
+    try {
+      process.kill(running.pid, 'SIGKILL')
+    } catch {
+      // Already gone.
+    }
+    await running.done
+  })
+
+  it('releases the escalation when the wait observes no live work', async () => {
+    const sweeps: Array<{ pid: number; identity: string | undefined }> = []
+    const running = spawnSubprocess(spec('sleep 60', { graceMs: 500 }), {
+      spillDir,
+      platform: 'win32',
+      win32TreeSweep: {
+        captureRootIdentity: () => 'root-identity',
+        sweep: (rootPid, identity) => { sweeps.push({ pid: rootPid, identity }); return true },
+        hasLiveWork: () => false,
+      },
+    })
+    running.terminate()
+    expect(sweeps).toHaveLength(1)
+    try {
+      process.kill(running.pid, 'SIGKILL')
+    } catch {
+      // Already gone.
+    }
+    await running.done
+    // The observer finds no live work and releases the armed escalation well
+    // before its grace period could fire.
+    await expect(running.waitForExit()).resolves.toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 600))
+    expect(sweeps).toHaveLength(1)
+  })
+})
+
+const win32Real = process.platform === 'win32' ? describe : describe.skip
+
+win32Real('windows orphan reclamation (real process table)', () => {
+  it('terminates a descendant that outlived its naturally exited root', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dsh-subprocess-orphan-'))
+    try {
+      const pidFile = join(dir, 'descendant.pid')
+      const rootScript = [
+        `const fs = require('node:fs');`,
+        `const cp = require('node:child_process');`,
+        `const child = cp.spawn(process.execPath, ['-e', 'fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 60000)']);`,
+        'child.unref()',
+        `const wait = () => { fs.existsSync(${JSON.stringify(pidFile)}) ? process.exit(0) : setTimeout(wait, 10); }`,
+        'wait()',
+      ].join('\n')
+      const running = spawnSubprocess({
+        argv: [process.execPath, '-e', rootScript],
+        cwd: process.cwd(),
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 64_000 }, stderr: { maxBytes: 64_000 } },
+        graceMs: 200,
+      })
+      // The root spawns the descendant, waits for the pid file, and exits on
+      // its own — the exact shape terminate() previously could not reach.
+      const outcome = await running.done
+      expect(outcome.exitCode).toBe(0)
+      const descendantPid = Number(readFileSync(pidFile, 'utf8'))
+      expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true)
+      const alive = (): boolean => {
+        try {
+          process.kill(descendantPid, 0)
+          return true
+        } catch {
+          return false
+        }
+      }
+      expect(alive()).toBe(true)
+
+      running.terminate()
+      await vi.waitFor(() => expect(alive()).toBe(false), { interval: 25, timeout: 10_000 })
+      await expect(running.waitForExit()).resolves.toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

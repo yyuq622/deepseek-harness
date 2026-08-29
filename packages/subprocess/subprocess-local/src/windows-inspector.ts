@@ -50,14 +50,23 @@ export interface WindowsProcessInspectorInternals {
 /* jscpd:ignore-start -- the Windows inspector deliberately mirrors process-inspector.ts:
    the decision logic (tree walk, identity fencing, group signalling) is the same contract over
    Win32 primitives, per the persistent-pty note 2026-08-11-pwsh-persistent-pty. */
-export function windowsProcessTree(
+
+/**
+ * Walk a process table from one root pid, children-first, retaining only
+ * members whose start identity is readable (unreadable members are detector
+ * misses, exactly like an unreadable `/proc` entry on Linux). With
+ * `requireRoot` the walk starts at the root's own entry; without it, the walk
+ * starts at the root pid's children — descendants of an exited root keep
+ * their `th32ParentProcessID` link to the absent pid.
+ */
+function walkProcessTable(
   entries: ProcessEntry[],
   rootPid: number,
   started: (pid: number) => string | undefined,
+  requireRoot: boolean,
 ): ProcessIdentity[] {
   const byPid = new Map(entries.map(entry => [entry.pid, entry]))
   const root = byPid.get(rootPid)
-  if (root === undefined) return []
   const byParent = new Map<number, ProcessEntry[]>()
   for (const entry of entries) {
     const children = byParent.get(entry.parentPid) ?? []
@@ -73,8 +82,37 @@ export function windowsProcessTree(
     const identity = started(entry.pid)
     if (identity !== undefined) result.push({ pid: entry.pid, started: identity })
   }
-  visit(root)
+  if (requireRoot) {
+    if (root === undefined) return []
+    visit(root)
+  } else {
+    for (const child of byParent.get(rootPid) ?? []) visit(child)
+  }
   return result
+}
+
+/** Walk a rooted tree: the root's own entry must be present in the table. */
+export function windowsProcessTree(
+  entries: ProcessEntry[],
+  rootPid: number,
+  started: (pid: number) => string | undefined,
+): ProcessIdentity[] {
+  return walkProcessTable(entries, rootPid, started, true)
+}
+
+/**
+ * Walk the surviving descendants of an EXITED root: the root's own entry is
+ * absent from the table, while every descendant still carries the root pid as
+ * its parent link. A root pid reused by a later process makes its children
+ * indistinguishable from the exited root's orphans — the sweep's identity
+ * fencing is what decides whether they may be terminated.
+ */
+export function windowsOrphanTree(
+  entries: ProcessEntry[],
+  rootPid: number,
+  started: (pid: number) => string | undefined,
+): ProcessIdentity[] {
+  return walkProcessTable(entries, rootPid, started, false)
 }
 
 /**
@@ -146,6 +184,133 @@ function taskkillTree(pid: number, force: boolean): void {
   // Outcome deliberately unchecked: an already-absent tree, exit races, and a
   // missing taskkill binary are as tolerable here as ESRCH is for POSIX.
   spawnSync('taskkill', ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])], { stdio: 'ignore' })
+}
+
+/**
+ * Identity-fenced Windows tree termination for one spawned root. The root's
+ * creation-time identity is captured right after spawn; every termination
+ * consults the process table first, so a reused root pid is never terminated,
+ * and a root that exited on its own hands the termination to its surviving
+ * descendants — whose parent links still name the exited root. This is the
+ * Windows counterpart of POSIX group signalling, which reaches in-group
+ * orphans that a blind `taskkill /T` (needing a live root) cannot.
+ */
+export interface WindowsTreeSweep {
+  /**
+   * Read the root's creation-time identity immediately after spawn.
+   * @param rootPid - the spawned root's pid.
+   * @returns the identity string, or undefined when the table cannot read one.
+   */
+  captureRootIdentity(rootPid: number): string | undefined
+  /**
+   * Terminate the tree once: taskkill the live root (its current creation
+   * identity must still match the captured one), or — once the root is gone —
+   * every surviving descendant reachable by parent link, each re-verified by
+   * identity immediately before its own taskkill. Force is always set: any
+   * Windows signal maps to TerminateProcess semantics.
+   * @param rootPid - the spawned root's pid.
+   * @param rootIdentity - the identity captured at spawn; undefined falls back to pid-targeted termination of a live root.
+   * @returns true when a live root was terminated or at least one descendant was killed; false when nothing alive was found, or the root pid was reused.
+   */
+  sweep(rootPid: number, rootIdentity: string | undefined): boolean
+  /**
+   * Read-only sweep question: whether any live work remains — a live root the
+   * sweep would terminate, or at least one surviving descendant. Never
+   * terminates anything; the wait path uses this to decide whether a pending
+   * escalation still has something to reach.
+   * @param rootPid - the spawned root's pid.
+   * @param rootIdentity - the identity captured at spawn.
+   * @returns true when live work remains.
+   */
+  hasLiveWork(rootPid: number, rootIdentity: string | undefined): boolean
+}
+
+/** One snapshot's termination targets: the live root, or the orphan set. */
+interface SweepTargets {
+  /** Whether the root pid is occupied by a process the sweep may terminate. */
+  terminateRoot: boolean
+  /** Surviving descendants of an exited root, children-first, readable identities only. */
+  orphans: ProcessIdentity[]
+}
+
+function resolveSweepTargets(
+  internals: WindowsProcessInspectorInternals,
+  entries: ProcessEntry[],
+  rootPid: number,
+  rootIdentity: string | undefined,
+): SweepTargets {
+  // `active` separates a live root from an exited one whose process object is
+  // still referenced (OpenProcess and GetProcessTimes keep succeeding for it):
+  // only a live root takes the tree-kill branch, and an exited root hands the
+  // sweep to its descendants even while handles keep its state readable.
+  const rootState = internals.processState(rootPid)
+  if (rootState !== undefined && rootState.active) {
+    // The pid is occupied: terminate only when the occupant is still the
+    // process the handle spawned. An occupied pid with an unreadable state
+    // and a known identity is refused — the occupant cannot be proven ours.
+    return { terminateRoot: rootIdentity === undefined || rootState.started === rootIdentity, orphans: [] }
+  }
+  return { terminateRoot: false, orphans: windowsOrphanTree(entries, rootPid, pid => internals.processState(pid)?.started) }
+}
+
+/**
+ * The real sweep over the koffi-backed process table.
+ * @param internals - injectable process operations; defaults to the real table.
+ * @returns the sweep every Windows spawn termination tier uses.
+ */
+export function createWindowsTreeSweep(
+  internals: WindowsProcessInspectorInternals = defaultWindowsProcessInternals(),
+): WindowsTreeSweep {
+  return {
+    captureRootIdentity: rootPid => internals.processState(rootPid)?.started,
+    sweep: (rootPid, rootIdentity) => {
+      const { terminateRoot, orphans } = resolveSweepTargets(
+        internals,
+        internals.snapshot(),
+        rootPid,
+        rootIdentity,
+      )
+      let killed = false
+      if (terminateRoot) {
+        internals.taskkill(rootPid, true)
+        killed = true
+      }
+      for (const identity of orphans) {
+        // Re-verify immediately before the kill: a candidate that exited and
+        // whose pid was reused between the snapshot and this kill is skipped
+        // rather than signalled.
+        const current = internals.processState(identity.pid)
+        if (current === undefined || !current.active || current.started !== identity.started) continue
+        internals.taskkill(identity.pid, true)
+        killed = true
+      }
+      return killed
+    },
+    hasLiveWork: (rootPid, rootIdentity) => {
+      const { terminateRoot, orphans } = resolveSweepTargets(
+        internals,
+        internals.snapshot(),
+        rootPid,
+        rootIdentity,
+      )
+      if (terminateRoot) return true
+      return orphans.some((identity) => {
+        const current = internals.processState(identity.pid)
+        return current !== undefined && current.active && current.started === identity.started
+      })
+    },
+  }
+}
+
+/**
+ * The default sweep for a spawn on this host: the real koffi-backed sweep on
+ * Windows, undefined elsewhere (the win32 kill path then uses the legacy
+ * pid-targeted fallback).
+ * @returns the host default, or undefined off Windows.
+ */
+export function defaultWindowsTreeSweep(): WindowsTreeSweep | undefined {
+  /* v8 ignore next -- resolved only on a Windows host; POSIX CI exercises the legacy fallback through injected-platform tests. */
+  return process.platform === 'win32' ? createWindowsTreeSweep() : undefined
 }
 
 declare const nativePtr: unique symbol

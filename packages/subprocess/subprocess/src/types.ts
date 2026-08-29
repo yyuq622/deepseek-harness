@@ -161,8 +161,10 @@ export interface SubprocessCollectedOutputs {
  *
  * Termination is tree-scoped everywhere: POSIX signals the detached process
  * group (falling back to the direct child when the group is gone), Windows
- * terminates the tree via `taskkill /T`, so helper processes cannot outlive
- * the handle unnoticed.
+ * force-terminates the live root's tree via `taskkill /T` and — once the root
+ * has exited on its own — sweeps the descendants still reachable by their
+ * parent links, each fenced by creation identity so a reused pid is never
+ * terminated.
  */
 export interface SubprocessHandle {
   /** Process id (tree root); -1 when the spawn itself failed. */
@@ -179,9 +181,10 @@ export interface SubprocessHandle {
   readonly done: Promise<SubprocessOutcome>
   /**
    * Begin the SIGTERM → `graceMs` → SIGKILL escalation on the process tree
-   * (Windows force-terminates immediately) — the seam's only termination
-   * verb. Idempotent, a no-op once the tree is gone (the pid may be reused),
-   * and also triggered by the spec's abort signal.
+   * (Windows force-terminates immediately and re-sweeps once after the grace,
+   * reaching descendants of a root that already exited) — the seam's only
+   * termination verb. Idempotent, a no-op once the tree is gone (the pid may
+   * be reused), and also triggered by the spec's abort signal.
    */
   terminate(): void
   /**
