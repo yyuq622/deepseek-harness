@@ -9,6 +9,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
+import { debuglog } from 'node:util'
 import { DSH_ENV_PREFIX } from './types.ts'
 import type { SubprocessHandle, SubprocessSpawnSpec } from './types.ts'
 import type { SubprocessTerminalHandle, SubprocessTerminalSpawnSpec } from './types.ts'
@@ -40,8 +41,35 @@ export type {
  * process implicitly). One heuristic for every in-repo spawner; a
  * deliberately supplied entry survives because explicit env layers merge
  * after the scrub.
+ *
+ * The credential word must be a whole underscore-delimited segment
+ * (`DEEPSEEK_API_KEY`, `GITHUB_TOKEN`, `MY_SECRET_VALUE`), so benign names
+ * that merely contain a credential word (`TOKENIZERS_PARALLELISM`,
+ * `KEYCLOAK_HOST`) survive. Matching stays conservative within a segment: a
+ * suffixed shape (`PASSWORD_FILE`) is dropped — a name that shouts
+ * "credential" stays out of child environments unless
+ * {@link SCRUB_ALLOWED_ENV_KEYS} admits it. Differently named secrets (for
+ * example `*PASSPHRASE*`) still pass through; that is the heuristic's
+ * documented cost.
  */
-export const SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
+export const SENSITIVE_ENV_PATTERN = /^(?:.*_)?(?:KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)(?:_.*)?$/i
+
+/**
+ * Ambient names the credential scrub deliberately keeps despite matching
+ * {@link SENSITIVE_ENV_PATTERN} — the recorded escape hatch for benign names
+ * whose benign-ness the segment rule cannot express (`TOKENIZERS_PARALLELISM`
+ * is the recorded example). Membership is matched case-insensitively
+ * (Windows environment names are case-insensitive), and it can never
+ * re-admit a `DSH_*` name, which the scrub drops unconditionally.
+ */
+export const SCRUB_ALLOWED_ENV_KEYS: ReadonlySet<string> = new Set([
+  // Benign under today's segment rule too; recorded so a future pattern
+  // loosening cannot silently start stripping it from child environments.
+  'TOKENIZERS_PARALLELISM',
+])
+
+/** Node debug channel for the scrub: `NODE_DEBUG=dsh-subprocess:env-scrub` prints dropped key NAMES (never values). */
+const envScrubDebug = debuglog('dsh-subprocess:env-scrub')
 
 /**
  * The ambient parent environment minus credential-shaped names and minus all
@@ -52,15 +80,33 @@ export const SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
  * which merges after this scrub). Both scrubs match case-insensitively:
  * Windows environment names are case-insensitive, so a parent `dsh_*` entry
  * would otherwise survive and read back as `$env:DSH_*` in the child;
- * deliberate lowercase `dsh_*` names on POSIX are implausible. Exported as a plain function so spawners
- * that cannot route through the service (node-pty backends, SDK-managed
- * transports) share the one scrub definition.
+ * deliberate lowercase `dsh_*` names on POSIX are implausible. The
+ * allowlist (checked before the pattern) survives even when the pattern
+ * matches; it never re-admits `DSH_*` names. Exported as a plain function so
+ * spawners that cannot route through the service (node-pty backends,
+ * SDK-managed transports) share the one scrub definition. Dropped
+ * credential-shaped key NAMES are printed on the
+ * `dsh-subprocess:env-scrub` debug channel — names only, never values — so
+ * an over-scrub is diagnosable instead of silent.
  * @returns a fresh environment object safe to hand to a child spawn.
  */
 export function scrubbedParentEnv(): Record<string, string> {
   const env: Record<string, string> = {}
+  const scrubbedKeys: string[] = []
   for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !SENSITIVE_ENV_PATTERN.test(key) && !key.toUpperCase().startsWith(DSH_ENV_PREFIX)) env[key] = value
+    if (key.toUpperCase().startsWith(DSH_ENV_PREFIX)) continue
+    if (SCRUB_ALLOWED_ENV_KEYS.has(key.toUpperCase())) {
+      env[key] = value
+      continue
+    }
+    if (SENSITIVE_ENV_PATTERN.test(key)) {
+      scrubbedKeys.push(key)
+      continue
+    }
+    if (value !== undefined) env[key] = value
+  }
+  if (scrubbedKeys.length > 0) {
+    envScrubDebug('credential-shaped ambient names dropped from the child environment: %s', scrubbedKeys.sort().join(', '))
   }
   return env
 }

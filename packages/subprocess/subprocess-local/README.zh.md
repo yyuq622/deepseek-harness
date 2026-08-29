@@ -126,7 +126,7 @@ spill 文件以 `0600` 权限、`O_EXCL` 与随机名称在 `0700` 每进程目�
 - **Windows 终端信号是控制台级的**——SIGINT 以 `\x03` Ctrl-C 输入写入投递，由 conhost 转为控制台级 CTRL_C 事件；SIGTSTP 与 SIGHUP 因不可用而被拒绝；不带 `/F` 的 `taskkill` 无法终止控制台进程，因此拆卸的 TERM 档是 `/F` 升级前的宽限等待。
 - **守护化的终端后代仍可能逃出可观察边界**——在 macOS 上，子进程如果在任何前台检查快照之前重新设定父进程，将无法再从 PTY 根进程发现；在 Linux 上，调用 `setsid` 的子进程会同时离开进程树与自有终端会话；本提供方不新增持续进程表监视器。
 - **进程内清理要求退出阶段仍能执行 JavaScript**——直接 `process.exit()`、默认未捕获异常和默认未处理 rejection 会发出 Node 同步 `exit` 事件；未处理的 `SIGTERM`、`SIGINT` 或 `SIGHUP`、`SIGKILL`、fatal OOM、`process.abort()`、native crash 与断电，都需要外部 supervisor、容器 init 或等价的 OS 所有者负责。
-- **凭据清除依赖名称启发式规则**——只匹配 `*KEY*`/`*PASSWORD*`/`*SECRET*`/`*TOKEN*`；名称不同的 secret（例如 `*PASSPHRASE*`）会继续传递，对误删变量引入白名单属于已记录的后续工作。
+- **凭据清除依赖名称启发式规则**——匹配下划线整段形状（`*_KEY`、`*_SECRET`、`*_TOKEN`、`*_PASSWORD`、`*_CREDENTIAL` 及其带前缀的形状）；名称不同的 secret（例如 `*PASSPHRASE*`）会继续传递；白名单 `SCRUB_ALLOWED_ENV_KEYS` 记录例外，被剥离的键名（绝不包含值）会打印到 `dsh-subprocess:env-scrub` Node 调试通道。
 - **执行器自管的 spill 文件存活整个进程生命周期**——后台读取随时可能宣告其路径，因此未经前台 spill-store 交接的文件（后台进程、无归属调用方）在服务 dispose 与进程退出阶段回收，而不是逐命令删除；运行时的文件登记表每创建一个 spill 文件增加一个条目。
 
 <a id="dev-note"></a>

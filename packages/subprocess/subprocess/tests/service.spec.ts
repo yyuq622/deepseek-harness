@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { PassThrough } from 'node:stream'
 import { Context } from '@deepseek-ai/cordis'
-import { scrubbedParentEnv, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import { scrubbedParentEnv, SCRUB_ALLOWED_ENV_KEYS, SENSITIVE_ENV_PATTERN, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type {
   SubprocessHandle,
   SubprocessOutputRead,
@@ -96,5 +96,44 @@ describe('SubprocessRuntime seam', () => {
       delete process.env.SCRUB_PROBE_PASSWORD
       delete process.env.SCRUB_PROBE_PLAIN
     }
+  })
+
+  it('scrubbedParentEnv keeps names that merely contain a credential word and drops whole-segment shapes', () => {
+    process.env.TOKENIZERS_PARALLELISM = 'false'
+    process.env.KEYCLOAK_HOST = 'internal.example'
+    process.env.GPG_KEY = 'secret-shaped'
+    process.env.SCRUB_PROBE_SECRET_VALUE = 'secret'
+    try {
+      const env = scrubbedParentEnv()
+      // The credential word must be its own underscore-delimited segment.
+      expect(env.TOKENIZERS_PARALLELISM).toBe('false')
+      expect(env.KEYCLOAK_HOST).toBe('internal.example')
+      expect(env.GPG_KEY).toBeUndefined()
+      expect(env.SCRUB_PROBE_SECRET_VALUE).toBeUndefined()
+    } finally {
+      delete process.env.TOKENIZERS_PARALLELISM
+      delete process.env.KEYCLOAK_HOST
+      delete process.env.GPG_KEY
+      delete process.env.SCRUB_PROBE_SECRET_VALUE
+    }
+  })
+
+  it('scrubbedParentEnv admits allowlisted names case-insensitively', () => {
+    process.env.tokenizers_parallelism = 'false'
+    try {
+      expect(scrubbedParentEnv().tokenizers_parallelism).toBe('false')
+    } finally {
+      delete process.env.tokenizers_parallelism
+    }
+  })
+
+  it('the anchored pattern spares containment-only names, and the allowlist records the exception', () => {
+    expect(SENSITIVE_ENV_PATTERN.test('TOKENIZERS_PARALLELISM')).toBe(false)
+    expect(SENSITIVE_ENV_PATTERN.test('KEYCLOAK_HOST')).toBe(false)
+    expect(SENSITIVE_ENV_PATTERN.test('DEEPSEEK_API_KEY')).toBe(true)
+    expect(SENSITIVE_ENV_PATTERN.test('MY_SECRET_VALUE')).toBe(true)
+    expect(SENSITIVE_ENV_PATTERN.test('PASSWORD_FILE')).toBe(true)
+    expect(SCRUB_ALLOWED_ENV_KEYS.has('TOKENIZERS_PARALLELISM')).toBe(true)
+    expect(SCRUB_ALLOWED_ENV_KEYS.has('DSH_SESSION_ID')).toBe(false)
   })
 })
