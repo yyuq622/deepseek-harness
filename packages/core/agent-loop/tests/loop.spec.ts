@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import LlmRuntime, { createUserMessage, ToolCallId, LlmError, ReasoningEffortId, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, TurnEndReason } from '@deepseek-ai/dsh-session'
@@ -1528,5 +1528,89 @@ describe('agent loop', () => {
     expect(replayed.events.slice(0, agent.session.seq).map(e => e.type)).toEqual(
       agent.session.events.map(e => e.type))
     expect(replayed.events.at(-1)?.type).toBe('session/end-seed')
+  })
+})
+
+describe('turn boundary persistence faults', () => {
+  /** Throw from `session.append` for the named boundary events; pass everything else through. */
+  function failAppendOn(agent: Agent, failing: readonly string[]): { mockRestore(): void } {
+    const realAppend = agent.session.append.bind(agent.session)
+    return vi.spyOn(agent.session, 'append').mockImplementation(((type: string, data?: unknown, options?: unknown) => {
+      if (failing.includes(type)) throw new Error('disk full')
+      return realAppend(type as never, data, options as never)
+    }) as unknown as typeof agent.session.append)
+  }
+
+  function collectErrors(ctx: Context): Error[] {
+    const errors: Error[] = []
+    ctx.on('agent/error', ({ error }) => {
+      if (error instanceof Error) errors.push(error)
+    })
+    return errors
+  }
+
+  it('keeps the step failure as the turn outcome when step/end persistence also fails', async () => {
+    const adapter = new MockAdapter([
+      () => { throw new Error('provider exploded') },
+      textResponse('ok after rescue'),
+    ])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
+    const appendSpy = failAppendOn(agent, ['step/end'])
+    const errors = collectErrors(ctx)
+
+    send(agent, 'hi')
+    await waitForIdle(ctx, agent)
+
+    // Both faults surface, each on its own: the persistence fault reports
+    // during unwinding, and the step failure still classifies the turn.
+    expect(errors.map(error => error.message)).toEqual(['disk full', 'provider exploded'])
+    const turnEnd = agent.session.events.find(event => event.type === 'turn/end')
+    expect(turnEnd?.type === 'turn/end' && turnEnd.data.reason.kind).toBe('error')
+    expect(turnEnd?.type === 'turn/end' && turnEnd.data.reason.kind === 'error'
+      ? turnEnd.data.reason.error.message
+      : '').toContain('provider exploded')
+
+    // The loop survived: with persistence restored, the next turn persists
+    // its boundaries normally.
+    appendSpy.mockRestore()
+    send(agent, 'again')
+    await waitForIdle(ctx, agent)
+    expect(adapter.requests).toHaveLength(2)
+    expect(agent.session.events.some(event => event.type === 'step/end')).toBe(true)
+  })
+
+  it('reports both boundary faults of one healthy turn without dropping the turn', async () => {
+    // A healthy step whose step/end AND turn/end appends both fail: neither
+    // fault is a step failure, so the first becomes the turn error and the
+    // second is reported on its own during the finally unwind.
+    const adapter = new MockAdapter([textResponse('ok')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('a2'), { provider: 'mock', model: 'mock' })
+    failAppendOn(agent, ['step/end', 'turn/end'])
+    const errors = collectErrors(ctx)
+
+    send(agent, 'hi')
+    await waitForIdle(ctx, agent)
+
+    expect(errors.map(error => error.message)).toEqual(['disk full', 'disk full'])
+    expect(agent.session.events.find(event => event.type === 'turn/end')).toBeUndefined()
+    expect(agent.status).toBe('idle')
+  })
+
+  it('makes a turn/end persistence fault the turn error after a healthy step', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('a3'), { provider: 'mock', model: 'mock' })
+    failAppendOn(agent, ['turn/end'])
+    const errors = collectErrors(ctx)
+
+    send(agent, 'hi')
+    await waitForIdle(ctx, agent)
+
+    expect(errors.map(error => error.message)).toEqual(['disk full'])
+    expect(agent.status).toBe('idle')
+    // The step's own events persisted; only the closing boundary was lost.
+    expect(agent.session.events.some(event => event.type === 'assistant/message')).toBe(true)
   })
 })

@@ -208,10 +208,21 @@ export class ReactLoopAgent implements Agent {
 
   /** Report one failure at its live boundary, then preserve it for driver containment. */
   private throwError(error: unknown): never {
+    this.reportError(error)
+    throw error
+  }
+
+  /**
+   * Emit one failure at its live boundary without throwing — the reporting
+   * half of {@link throwError}, for a fault (a persistence failure inside a
+   * `finally`) that must be surfaced without replacing an error already in
+   * flight. The fused dispatcher contains listener failures, so reporting
+   * from an unwind path cannot mask the original.
+   */
+  private reportError(error: unknown): void {
     const turn = this.phase.kind === 'running' ? this.phase.turn : this.phase.lastTurn
     const step = this.phase.kind === 'running' ? this.phase.step : 0
     this.dispatch.emit('agent/error', { turn, step, error })
-    throw error
   }
 
   private async kick(): Promise<void> {
@@ -265,6 +276,7 @@ export class ReactLoopAgent implements Agent {
     }
     phase.turn = turn
     let turnEnds: TurnEndReason | null = null
+    let turnFailed = false
     let target: InboxTarget = 'next-turn'
     try {
       while (true) {
@@ -285,6 +297,11 @@ export class ReactLoopAgent implements Agent {
         signal.throwIfAborted()
         this.session.append('step/start', { turn, step })
         phase.step = step
+        // A step/end persistence fault must not replace an in-flight step
+        // failure: the fault is reported on its own and the original error
+        // keeps propagating as the turn outcome. Without one, the append
+        // fault IS the step's outcome and propagates.
+        let stepFailed = false
         try {
           for (const message of decision.messages) {
             this.session.append('user/message', message, { surfaceOp: 'append' })
@@ -295,8 +312,16 @@ export class ReactLoopAgent implements Agent {
           // max-tokens stays sticky: a later completed step must not
           // downgrade the turn outcome.
           if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
+        } catch (error: unknown) {
+          stepFailed = true
+          throw error
         } finally {
-          this.session.append('step/end', { turn, step })
+          try {
+            this.session.append('step/end', { turn, step })
+          } catch (appendError: unknown) {
+            if (stepFailed) this.reportError(appendError)
+            else throw appendError
+          }
         }
         signal.throwIfAborted()
         if (turnEnds && this.inbox.nextStep.length === 0) {
@@ -307,6 +332,7 @@ export class ReactLoopAgent implements Agent {
         target = 'next-step'
       }
     } catch (error: unknown) {
+      turnFailed = true
       if (signal.aborted) {
         turnEnds = { kind: 'aborted', reason: signal.reason as AgentCancelCause }
         throw error
@@ -324,8 +350,13 @@ export class ReactLoopAgent implements Agent {
       try {
         // oxlint-disable-next-line typescript/no-non-null-assertion -- every exit assigns a turn ending
         this.session.append('turn/end', { turn, reason: turnEnds! })
-      } catch (error: unknown) {
-        this.throwError(error)
+      } catch (appendError: unknown) {
+        // A turn/end persistence fault must not replace an in-flight failure
+        // (the outcome the catch already classified): report it on its own and
+        // let the original keep propagating. Without one, the append fault is
+        // the turn's failure and takes the full reporting path.
+        if (turnFailed) this.reportError(appendError)
+        else this.throwError(appendError)
       }
     }
     if (!this.inbox.hasPending) return false
