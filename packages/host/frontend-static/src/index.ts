@@ -8,7 +8,10 @@
  * webserver's index render (structured injection rows, then raw taps).
  * Non-index assets stay public. A link planted inside the dist cannot serve a
  * file outside it: file targets are resolved to their final location with
- * `realpath` and re-verified against the real root before any bytes move. The
+ * `realpath` and re-verified against the real root before any bytes move.
+ * Content-hash-named assets serve `immutable`, the index serves `no-cache`
+ * with an ETag over its rendered body, and files at or above 1 MiB stream
+ * from disk instead of buffering whole. The
  * dist location is workspace knowledge of
  * the composing application, so `distIndex` is typically supplied through a
  * `!!js` expression, never hardcoded by a deployment.
@@ -16,8 +19,10 @@
  */
 
 import type { ServerResponse } from 'node:http'
-import { readFile, realpath, realpathSync } from 'node:fs/promises'
+import { createReadStream, realpathSync } from 'node:fs'
+import { readFile, realpath, stat } from 'node:fs/promises'
 import { basename, dirname, extname, join, normalize, resolve, sep } from 'node:path'
+import { createHash } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -62,6 +67,19 @@ const STATIC_MISS_CODES: ReadonlySet<string | undefined> = new Set([
 ])
 
 /**
+ * Content-hash-shaped asset names (a Vite-style `-hash` segment before the
+ * extension) are served `immutable`: in a content-hashed dist the same name
+ * is the same content, so browsers never revalidate them.
+ */
+const HASHED_ASSET = /-[A-Za-z0-9_-]{8}\.[A-Za-z0-9.]+$/
+
+/** Files at or above this size stream from disk instead of buffering whole. */
+const STREAM_FILE_MIN_BYTES = 1_048_576
+
+/** Cache lifetime for content-hash-named assets: one year, the standard immutable bound. */
+const HASHED_ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable'
+
+/**
  * Whether `target` is `root` itself or stays beneath it. Path case folds on
  * Windows, where realpath reports on-disk casing that can differ from the
  * casing the dist root was configured with.
@@ -73,6 +91,38 @@ function underRoot(target: string, root: string): boolean {
   return targetPath === rootPath || targetPath.startsWith(rootPath + sep)
 }
 
+/** Weak ETag over the rendered index body: injection rows and taps participate. */
+function weakEtag(body: string): string {
+  return `W/"${createHash('sha256').update(body).digest('base64url')}"`
+}
+
+/** RFC 7232 If-None-Match matching: `*`, exact, or weak comparison per candidate. */
+function etagMatches(ifNoneMatch: string, etag: string): boolean {
+  const normalize = (value: string): string => value.trim().replace(/^W\//, '')
+  const target = normalize(etag)
+  return ifNoneMatch.split(',').some((candidate) => {
+    const value = normalize(candidate)
+    return value === '*' || value === target
+  })
+}
+
+/** Stream one file to the response with contained failure: a mid-stream error
+ * destroys the response (the client sees a truncated body) instead of
+ * throwing after the headers are already written. Resolves when the stream
+ * finishes or the response closes. */
+function streamFile(res: ServerResponse, path: string): Promise<void> {
+  return new Promise((resolve) => {
+    const stream = createReadStream(path)
+    const done = (): void => {
+      stream.destroy()
+      resolve()
+    }
+    stream.on('error', () => { res.destroy() })
+    res.on('close', done)
+    stream.pipe(res)
+  })
+}
+
 /**
  * Serve one GET/HEAD static request from the dist root.
  * @param pathname - decoded URL pathname of the request.
@@ -82,11 +132,13 @@ function underRoot(target: string, root: string): boolean {
  * @param authorizeIndex - authenticates an index response before its bytes are read.
  * @param renderIndex - produces the index.html body (structured injection
  * rendering) for the dist root and configured index path.
+ * @param ifNoneMatch - the request's If-None-Match header, for index revalidation.
  */
 export async function serveStatic(
   pathname: string, res: ServerResponse, distRoot: string, distIndex: string,
   authorizeIndex: () => boolean,
   renderIndex: () => Promise<string>,
+  ifNoneMatch?: string | undefined,
 ): Promise<void> {
   const target = resolve(normalize(join(distRoot, pathname)))
   // Traversal rejection (lexical): the target must be distRoot itself (`/`) or
@@ -99,11 +151,22 @@ export async function serveStatic(
   }
   let body: string | Buffer
   let type: string
+  let cacheControl: string | undefined
+  let etag: string | undefined
   try {
     if (target === distRoot || target === distIndex) {
       if (!authorizeIndex()) return
       body = await renderIndex()
       type = HTML_MIME
+      // The rendered body carries the injection rows and taps, so the ETag is
+      // computed per render and no-cache forces revalidation on every visit.
+      cacheControl = 'no-cache'
+      etag = weakEtag(body)
+      if (ifNoneMatch !== undefined && etagMatches(ifNoneMatch, etag)) {
+        res.writeHead(304, { etag, 'cache-control': cacheControl })
+        res.end()
+        return
+      }
     } else {
       // readFile follows symlinks and junctions, so resolve the target to its
       // final location and re-verify containment against the real root before
@@ -116,8 +179,19 @@ export async function serveStatic(
         res.end()
         return
       }
-      body = await readFile(resolved)
+      const stats = await stat(resolved)
       type = MIME[extname(resolved)] ?? 'application/octet-stream'
+      if (HASHED_ASSET.test(resolved)) cacheControl = HASHED_ASSET_CACHE_CONTROL
+      if (stats.size >= STREAM_FILE_MIN_BYTES && res.req.method !== 'HEAD') {
+        res.writeHead(200, {
+          'content-type': type,
+          'content-length': String(stats.size),
+          ...cacheControl !== undefined ? { 'cache-control': cacheControl } : {},
+        })
+        await streamFile(res, resolved)
+        return
+      }
+      body = await readFile(resolved)
     }
   } catch (error) {
     // Only absent or non-file targets are 404; other filesystem failures reach
@@ -127,7 +201,11 @@ export async function serveStatic(
     res.end()
     return
   }
-  res.writeHead(200, { 'content-type': type })
+  res.writeHead(200, {
+    'content-type': type,
+    ...cacheControl !== undefined ? { 'cache-control': cacheControl } : {},
+    ...etag !== undefined ? { etag } : {},
+  })
   res.end(body)
 }
 
@@ -169,6 +247,7 @@ export function apply(ctx: Context, config: Config): void {
       distIndexReal,
       () => ctx.connection.authorizeIndex(req, res),
       renderIndex,
+      Array.isArray(req.headers['if-none-match']) ? req.headers['if-none-match'][0] : req.headers['if-none-match'],
     )
   }), 'frontend-static: fallback seat')
 }

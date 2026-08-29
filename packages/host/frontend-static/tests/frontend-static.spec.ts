@@ -221,4 +221,53 @@ describe('real Loader composition', () => {
     expect((await request(server.port, '/app.js')).status).toBe(200)
     expect((await request(server.port, '/escape/secret.txt')).status).toBe(403)
   })
+
+  it('sends cache headers: immutable for hashed assets, no-cache + ETag for the index', { timeout: 60_000 }, async () => {
+    const loaded = await loadComposition()
+    const server = loaded.webServer
+    const port = server.port
+    const launchUrl = loaded.connection.authenticatedUrl(`http://127.0.0.1:${String(port)}`)
+    const exchange = await fetch(launchUrl, { redirect: 'manual' })
+    const setCookie = exchange.headers.get('set-cookie')
+    if (setCookie === null) throw new Error('authenticated frontend did not set a cookie')
+    const cookie = setCookie.split(';', 1)[0]!
+    const authenticated = (init?: RequestInit): RequestInit => {
+      const headers = new Headers(init?.headers)
+      headers.set('cookie', cookie)
+      return { ...init, headers }
+    }
+
+    // A content-hash-shaped name is immutable; an unhashed name carries no
+    // cache directive.
+    await writeFile(join(root!, 'dist', 'app-B3Kj9fQx.js'), 'export {}')
+    const hashed = await fetch(`http://127.0.0.1:${String(port)}/app-B3Kj9fQx.js`)
+    expect(hashed.status).toBe(200)
+    expect(hashed.headers.get('cache-control')).toBe('public, max-age=31536000, immutable')
+    const plain = await fetch(`http://127.0.0.1:${String(port)}/app.js`)
+    expect(plain.headers.get('cache-control')).toBeUndefined()
+
+    // The index is no-cache with an ETag over its rendered body, and an
+    // If-None-Match revalidation answers 304 until the body changes.
+    const index = await fetch(`http://127.0.0.1:${String(port)}/`, authenticated())
+    expect(index.status).toBe(200)
+    expect(index.headers.get('cache-control')).toBe('no-cache')
+    const etag = index.headers.get('etag')
+    expect(etag).toBeTypeOf('string')
+    const revalidated = await fetch(`http://127.0.0.1:${String(port)}/`, authenticated({ headers: { 'if-none-match': etag! } }))
+    expect(revalidated.status).toBe(304)
+    const untap = server.tapIndex(html => html.replace('<head>', '<head><script>window.__T__=1</script>'))
+    const changed = await fetch(`http://127.0.0.1:${String(port)}/`, authenticated({ headers: { 'if-none-match': etag! } }))
+    expect(changed.status).toBe(200)
+    expect(changed.headers.get('etag')).not.toBe(etag)
+    untap()
+
+    // Files at or above the streaming threshold carry their content length
+    // and stream completely.
+    const big = Buffer.alloc(1_500_000, 7)
+    await writeFile(join(root!, 'dist', 'big-blob.bin'), big)
+    const streamed = await fetch(`http://127.0.0.1:${String(port)}/big-blob.bin`)
+    expect(streamed.status).toBe(200)
+    expect(streamed.headers.get('content-length')).toBe(String(big.length))
+    expect((await streamed.arrayBuffer()).byteLength).toBe(big.length)
+  })
 })

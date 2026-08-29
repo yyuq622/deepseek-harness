@@ -41,6 +41,8 @@ kind: "package-reference"
 
 请求从 dist 根目录（包含 `distIndex` 的目录）提供。dist 根目录与配置的 index 路径以 HTTP 200 渲染 `index.html`；任何其他已有文件按自身 MIME 类型直接提供，未知扩展名按 `application/octet-stream` 提供。解析到根目录之外的路径——无论词法上、还是经 dist 内植入的符号链接或 junction——都以 403 拒绝，因此精心构造的路径或植入的链接无法读取 dist 之上的文件。dist 根目录内缺失或非文件的 target——文件缺失、目录或配置的 index 缺失——返回空 404。没有匹配具名路由的非 GET／HEAD 请求回答 405。每个成功的 index 响应都经 webserver 的 `renderIndex` 渲染，因此启动 manifest 在 `/` 与配置的 index 路径上到达页面。
 
+缓存跟随 dist 的命名方式：内容哈希形状的资产名（Vite 风格的扩展名前 `-hash` 分段）以 `Cache-Control: public, max-age=31536000, immutable` 提供，其他文件不携带缓存指令。index 以 `Cache-Control: no-cache` 提供并携带其渲染正文上的弱 ETag，匹配的 If-None-Match 以 304 应答。达到 1 MiB 的文件以显式 content length 从磁盘流式提供，而不是整体缓冲。
+
 根路径与配置的 index 响应会在读取 HTML 前调用 `ctx.connection.authorizeIndex`。有效进程 token 会得到 303 重定向与持久浏览器 cookie；已有有效 cookie 时直接提供 index；其他 index 请求得到 Connection 所有的 401 响应。非 index 文件仍是公开静态资源。Token、cookie、过期时间与签名记录语义都归 Connection 所有。
 
 ### 可观察的失败
