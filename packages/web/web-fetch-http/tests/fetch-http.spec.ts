@@ -6,7 +6,8 @@ import WebRuntime from '@deepseek-ai/dsh-web'
 import { HttpFetchProvider, LOCAL_FETCH_PROVIDER_ID } from '@deepseek-ai/dsh-web-fetch-http'
 import type { HttpFetchLimits, HttpFetchResolver } from '@deepseek-ai/dsh-web-fetch-http'
 import * as fetchPlugin from '@deepseek-ai/dsh-web-fetch-http'
-import { createPinnedLookup, isPublicIpAddress, publicHttpNetwork, requestPinned, resolvePublicAddresses } from '../src/network.ts'
+import { closePinnedAgentPool, createPinnedLookup, isPublicIpAddress, PinnedAgentPool, poolKey, publicHttpNetwork, requestPinned, resolvePublicAddresses } from '../src/network.ts'
+import type { PooledDispatcher } from '../src/network.ts'
 import {
   classifyContentType,
   decoderForCharset,
@@ -45,6 +46,8 @@ beforeEach(async () => {
 afterEach(async () => {
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
+  // Pooled keep-alive sockets would hold `server.close()` open.
+  await closePinnedAgentPool()
   await new Promise<void>(resolve => server.close(() => { resolve() }))
 })
 
@@ -253,6 +256,99 @@ describe('public-network policy', () => {
     } finally {
       await request.close()
     }
+  })
+
+  it('reuses the pooled agent for consecutive same-site fetches and rebuilds after the ttl', async () => {
+    let connections = 0
+    const tracked = createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('pooled') })
+    tracked.on('connection', () => { connections += 1 })
+    await new Promise<void>(resolve => tracked.listen(0, '127.0.0.1', resolve))
+    try {
+      const { port } = tracked.address() as AddressInfo
+      const url = new URL(`http://does-not-resolve.invalid:${port}/`)
+      const addresses = [{ address: '127.0.0.1', family: 4 }]
+      const pool = new PinnedAgentPool<PooledDispatcher>({ ttlMs: 150 })
+      const first = await requestPinned(url, addresses, {}, new AbortController().signal, pool)
+      await first.response.text()
+      await first.close()
+      const second = await requestPinned(url, addresses, {}, new AbortController().signal, pool)
+      await second.response.text()
+      await second.close()
+      // The keep-alive connection was reused within the ttl.
+      expect(connections).toBe(1)
+      await new Promise(resolve => setTimeout(resolve, 200))
+      const third = await requestPinned(url, addresses, {}, new AbortController().signal, pool)
+      await third.response.text()
+      await third.close()
+      // The expired dispatcher was rebuilt and re-pinned for the fresh resolution.
+      expect(connections).toBe(2)
+    } finally {
+      await new Promise<void>(resolve => tracked.close(() => { resolve() }))
+    }
+  })
+})
+
+describe('pinned agent pool', () => {
+  it('builds the pool key from the host and the sorted validated address set', () => {
+    const sorted = poolKey('example.test', [{ address: '1.2.3.4', family: 4 }, { address: '2001::8', family: 6 }])
+    expect(sorted).toBe(poolKey('example.test', [{ address: '2001::8', family: 6 }, { address: '1.2.3.4', family: 4 }]))
+    expect(sorted).not.toBe(poolKey('other.test', [{ address: '1.2.3.4', family: 4 }]))
+    expect(sorted).not.toBe(poolKey('example.test', [{ address: '1.2.3.5', family: 4 }]))
+  })
+
+  it('reuses one entry for the same key while it is live', () => {
+    let created = 0
+    const pool = new PinnedAgentPool({ ttlMs: 1_000 })
+    const create = () => {
+      created += 1
+      return { close: async () => {} }
+    }
+    const first = pool.acquire('host|4/1.2.3.4', create)
+    expect(pool.acquire('host|4/1.2.3.4', create)).toBe(first)
+    expect(created).toBe(1)
+  })
+
+  it('rebuilds after the ttl expires and closes the expired entry', async () => {
+    let now = 0
+    let created = 0
+    const closed: string[] = []
+    const pool = new PinnedAgentPool({ ttlMs: 100, now: () => now })
+    const create = () => {
+      created += 1
+      return { close: async () => { closed.push(`agent-${created}`) } }
+    }
+    pool.acquire('k', create)
+    now = 99
+    pool.acquire('k', create)
+    expect(created).toBe(1)
+    now = 100
+    pool.acquire('k', create)
+    expect(created).toBe(2)
+    expect(closed).toEqual(['agent-1'])
+  })
+
+  it('evicts the least recently used entry over capacity', async () => {
+    const closed: string[] = []
+    const pool = new PinnedAgentPool({ maxEntries: 2 })
+    const make = (name: string) => () => ({ name, close: async () => { closed.push(name) } })
+    const first = pool.acquire('a', make('a'))
+    pool.acquire('b', make('b'))
+    // Re-acquiring 'a' refreshes its recency, so capacity pressure evicts 'b'.
+    expect(pool.acquire('a', make('a-refreshed'))).toBe(first)
+    pool.acquire('c', make('c'))
+    expect(closed).toEqual(['b'])
+    expect(pool.acquire('a', make('a-again'))).toBe(first)
+  })
+
+  it('disposes every pooled entry and empties the pool', async () => {
+    const closed: string[] = []
+    const pool = new PinnedAgentPool({ maxEntries: 4 })
+    const make = (name: string) => () => ({ name, close: async () => { closed.push(name) } })
+    const first = pool.acquire('a', make('a'))
+    pool.acquire('b', make('b'))
+    await pool.dispose()
+    expect(closed.sort()).toEqual(['a', 'b'])
+    expect(pool.acquire('a', make('a-new'))).not.toBe(first)
   })
 })
 
