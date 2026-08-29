@@ -47,6 +47,7 @@ kind: "package-reference"
 | `root` | 必填 | 所有会话文件的根目录 |
 | `packChunks` | `true` | 把符合条件的 `assistant/chunk` 连续段写为打包行；`false` 为诊断保留每事件一行 |
 | `compression` | `'zstd'` | 物理编码：`'zstd'` 带校验和帧，或 `'none'` 换行分隔 UTF-8 文本 |
+| `sync` | `'batch'` | 持久性：`'batch'` 对每个追加批次 fsync，`'turn'` 仅对关闭 `turn/end` 的批次 fsync，批间依赖 OS 回写 |
 | `preparedSessionCacheSize` | `5` | 为恢复复用而保留的冷会话准备结果数量 |
 | `writeBatchMaxDelayMs` | `200` | 实时事件的固定聚合窗口，单位为毫秒 |
 
@@ -68,7 +69,7 @@ kind: "package-reference"
 
 ### 持久性与崩溃语义
 
-会话延迟实体化：`create(meta)` 不写入任何内容，第一次 `append` 通过无覆盖发布写入并 `fsync` 编码后的 header 与第一批——因此已创建但从未 append 的会话不留下任何磁盘内容，除非生命周期消费方调用 `ensureMaterialized`，以无事件的单个 header 帧发布它。已 flush 事件绝不重写；后续每个批次追加行或一个压缩帧，捕获到写入或同步失败时把文件回滚到之前的字节长度。崩溃后，`load` 保留被中断的最终轮次：保留不完整最后帧中完整解码的记录，从该帧开头截断，并按共享持久化约定的要求，用合成工具、步骤与轮次 closer 重新编码这些记录。只有从未完整写入的撕裂尾部被丢弃；已提交前缀中的校验和、解压或结构失败以损坏拒绝。
+会话延迟实体化：`create(meta)` 不写入任何内容，第一次 `append` 通过无覆盖发布写入并 `fsync` 编码后的 header 与第一批——因此已创建但从未 append 的会话不留下任何磁盘内容，除非生命周期消费方调用 `ensureMaterialized`，以无事件的单个 header 帧发布它。已 flush 事件绝不重写；后续每个批次追加行或一个压缩帧，捕获到写入或同步失败时把文件回滚到之前的字节长度。`sync: 'batch'`（默认）下每个追加批次在 append resolve 前 fsync；`sync: 'turn'` 下只有关闭 `turn/end` 的批次被 fsync——已完成的轮次保持持久，而崩溃可能丢失进行中轮次的尾部，并走同一撕裂尾恢复。崩溃后，`load` 保留被中断的最终轮次：保留不完整最后帧中完整解码的记录，从该帧开头截断，并按共享持久化约定的要求，用合成工具、步骤与轮次 closer 重新编码这些记录。只有从未完整写入的撕裂尾部被丢弃；已提交前缀中的校验和、解压或结构失败以损坏拒绝。
 
 ### 读取日志
 

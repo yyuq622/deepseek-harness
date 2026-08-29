@@ -38,6 +38,16 @@ export type { JsonlCompression } from './format.ts'
 
 const DEFAULT_PACK_CHUNKS = true
 const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
+const DEFAULT_SYNC: JsonlSyncStrategy = 'batch'
+
+/** Durability strategy for appended batches: `'batch'` fsyncs every batch, `'turn'` only batches closing a turn. */
+export type JsonlSyncStrategy = 'batch' | 'turn'
+
+/** Loader schema for the JSONL artifact's durability strategy. */
+export const JsonlSyncStrategySchema: z<JsonlSyncStrategy> = z.union([
+  z.const('batch'),
+  z.const('turn'),
+]).default(DEFAULT_SYNC)
 /**
  * Internal scheduling constant, not deployment configuration: balance
  * frame-boundary event-loop yields against `setImmediate` overhead. One frame
@@ -78,6 +88,16 @@ export interface Config {
   packChunks?: boolean
   /** Physical encoding; defaults to checksummed Zstandard frames. */
   compression?: JsonlCompression
+  /**
+   * Durability strategy for appended batches. `'batch'` (default) fsyncs
+   * every appended batch before the append resolves: a crash loses nothing
+   * the caller was told was persisted, and high-volume streams pay one fsync
+   * per batch. `'turn'` fsyncs only batches that close a `turn/end` boundary
+   * — the log's commit/replay boundary — and relies on OS writeback between
+   * them: completed turns stay durable, while a crash can lose the tail of
+   * the in-flight turn (surfaced as a torn tail and recovered on next open).
+   */
+  sync?: JsonlSyncStrategy
   /** Maximum cold Session preparations retained for history-to-resume reuse. */
   preparedSessionCacheSize?: number
   /** Fixed live-event coalescing window; not a backend completion deadline. */
@@ -129,6 +149,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     root: z.string().required(),
     packChunks: z.boolean().default(DEFAULT_PACK_CHUNKS),
     compression: JsonlCompressionSchema,
+    sync: JsonlSyncStrategySchema,
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
     writeBatchMaxDelayMs: z.number().step(1).min(1).max(MAX_WRITE_BATCH_DELAY_MS)
       .default(DEFAULT_WRITE_BATCH_MAX_DELAY_MS),
@@ -144,6 +165,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   private root: string
   private packChunks: boolean
   private compression: JsonlCompression
+  private syncStrategy: JsonlSyncStrategy
   private coordinator: PersistenceCoordinator<JsonlTornMarker>
   private rootEncodingCheck: Promise<void> | undefined
 
@@ -158,6 +180,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       ?? DEFAULT_WRITE_BATCH_MAX_DELAY_MS
     this.packChunks = config.packChunks ?? DEFAULT_PACK_CHUNKS
     this.compression = config.compression ?? DEFAULT_COMPRESSION
+    this.syncStrategy = config.sync ?? DEFAULT_SYNC
     this.assertUsableRoot()
     this.coordinator = new PersistenceCoordinator<JsonlTornMarker>(this.ctx, this, {
       preparedSessionCacheSize,
@@ -663,9 +686,13 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   /* v8 ignore stop */
 
   /**
-   * Append and fsync event lines. On a partial write or sync failure, restore the
-   * previous size before rethrowing because the unchanged cursor will retry the
-   * batch; leaving partial bytes would create duplicate sequence numbers.
+   * Append event lines with the configured durability strategy. `'batch'`
+   * fsyncs before the append resolves; `'turn'` fsyncs only batches that
+   * close a `turn/end` boundary — the log's commit/replay boundary — and
+   * relies on OS writeback between them. On a partial write or sync failure,
+   * restore the previous size before rethrowing because the unchanged cursor
+   * will retry the batch; leaving partial bytes would create duplicate
+   * sequence numbers.
    */
   private async appendLines(meta: SessionHeader, events: readonly SessionEvent[]): Promise<void> {
     const content = await this.encodeEventBatch(events)
@@ -682,7 +709,9 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       const { size: before } = await handle.stat()
       try {
         await handle.writeFile(content)
-        await handle.sync()
+        if (this.syncStrategy === 'batch' || events.some(event => event.type === 'turn/end')) {
+          await handle.sync()
+        }
       } catch (error) {
         try {
           await closeAppendHandle()

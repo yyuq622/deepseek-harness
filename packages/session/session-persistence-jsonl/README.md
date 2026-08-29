@@ -47,6 +47,7 @@ Choose this backend when consumers benefit from one artifact per session — nav
 | `root` | required | Root directory for all session files |
 | `packChunks` | `true` | Write eligible `assistant/chunk` runs as packed rows; `false` keeps one event per line for diagnostics |
 | `compression` | `'zstd'` | Physical encoding: `'zstd'` checksummed frames, or `'none'` newline-delimited UTF-8 text |
+| `sync` | `'batch'` | Durability: `'batch'` fsyncs every appended batch, `'turn'` fsyncs only batches closing a `turn/end` and relies on OS writeback between them |
 | `preparedSessionCacheSize` | `5` | Cold session preparations retained for resume reuse |
 | `writeBatchMaxDelayMs` | `200` | Fixed live-event coalescing window, in milliseconds |
 
@@ -68,7 +69,7 @@ Session ids are injectively escaped to one safe path segment before use (no trav
 
 ### Durability and crash semantics
 
-A session is materialized lazily: `create(meta)` writes nothing, and the first `append` writes and `fsync`s the encoded header and first batch through a no-overwrite publish — so a created-but-never-appended session leaves nothing on disk unless a lifecycle consumer calls `ensureMaterialized`, which publishes one header frame without an event. Flushed events are never rewritten; each subsequent batch appends lines or one compressed frame, and a caught write or sync failure rolls the file back to its prior length. After a crash, `load` preserves an interrupted final turn: it keeps the complete decoded records of an incomplete last frame, truncates from that frame's start, and re-encodes the records with the synthetic tool, step, and turn closers required by the shared persistence contract. Only a never-fully-written torn tail is discarded; checksum, decompression, or structural failure in the committed prefix rejects as corruption.
+A session is materialized lazily: `create(meta)` writes nothing, and the first `append` writes and `fsync`s the encoded header and first batch through a no-overwrite publish — so a created-but-never-appended session leaves nothing on disk unless a lifecycle consumer calls `ensureMaterialized`, which publishes one header frame without an event. Flushed events are never rewritten; each subsequent batch appends lines or one compressed frame, and a caught write or sync failure rolls the file back to its prior length. Under `sync: 'batch'` (default) every appended batch is fsynced before its append resolves; under `sync: 'turn'` only batches closing a `turn/end` are fsynced — completed turns stay durable while a crash can lose the tail of the in-flight turn to the same torn-tail recovery. After a crash, `load` preserves an interrupted final turn: it keeps the complete decoded records of an incomplete last frame, truncates from that frame's start, and re-encodes the records with the synthetic tool, step, and turn closers required by the shared persistence contract. Only a never-fully-written torn tail is discarded; checksum, decompression, or structural failure in the committed prefix rejects as corruption.
 
 ### Reading the logs
 

@@ -8,6 +8,7 @@ import { performance } from 'node:perf_hooks'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import type { JsonlSyncStrategy } from '@deepseek-ai/dsh-session-persistence-jsonl'
 import { logPath, scanLog, sessionDir, toHeaderLine, type JsonlCompression } from '../src/format.ts'
 import {
   compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
@@ -40,13 +41,14 @@ async function freshRoot(prefix = 'dsh-jsonl-zstd-'): Promise<string> {
   return root
 }
 
-async function mount(root: string, compression?: JsonlCompression): Promise<Context> {
+async function mount(root: string, compression?: JsonlCompression, sync?: JsonlSyncStrategy): Promise<Context> {
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(SessionStore)
   await ctx.plugin(JsonlSessionPersistence, {
     root,
     ...(compression === undefined ? {} : { compression }),
+    ...(sync === undefined ? {} : { sync }),
   })
   return ctx
 }
@@ -93,6 +95,24 @@ function deterministicNoise(length: number): string {
     output += String.fromCharCode(33 + (state % 90))
   }
   return output
+}
+
+/** A batch with no turn boundary: its fsync behavior is strategy-dependent. */
+function nonTurnBatch(offset: number): SessionEvent[] {
+  return [
+    { type: 'user/message', seq: offset, time: offset + 1, data: {
+      id: 'batch-user', role: 'user',
+      content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+    }, surfaceOp: 'append' },
+    { type: 'step/start', seq: offset + 1, time: offset + 2, data: { turn: 1, step: 1 } },
+  ] as SessionEvent[]
+}
+
+/** The batch that closes a turn: the commit point the turn strategy fsyncs. */
+function turnClosingBatch(offset: number): SessionEvent[] {
+  return [
+    { type: 'turn/end', seq: offset, time: offset + 1, data: { turn: 1, reason: { kind: 'completed' } } },
+  ] as SessionEvent[]
 }
 
 function emptyStructuralFrame(descriptor: number): Buffer {
@@ -630,6 +650,46 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
       await compressZstdFrame('{"type":"turn/start"'),
     )
     await expect(ctx.sessionPersistence.load(header.id)).rejects.toThrow(/complete frame contains a torn JSONL record/)
+  })
+
+  it('fsyncs every appended batch under the default batch strategy', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root)
+    const header = meta('sync-batch')
+    await ctx.sessionPersistence.create(header)
+    const path = logPath(root, header.cwd, header.id, 'zstd')
+    const handle = await open(path, 'r')
+    const prototype = Object.getPrototypeOf(handle) as { sync: () => Promise<void> }
+    await handle.close()
+    const spy = vi.spyOn(prototype, 'sync')
+    await ctx.sessionPersistence.append(header.id, nonTurnBatch(0))
+    const afterFirst = spy.mock.calls.length
+    expect(afterFirst).toBeGreaterThan(0)
+    await ctx.sessionPersistence.append(header.id, nonTurnBatch(2))
+    expect(spy.mock.calls.length).toBeGreaterThan(afterFirst)
+  })
+
+  it('defers fsync to turn boundaries under the turn strategy', async () => {
+    const root = await freshRoot()
+    const ctx = await mount(root, undefined, 'turn')
+    const header = meta('sync-turn')
+    await ctx.sessionPersistence.create(header)
+    const path = logPath(root, header.cwd, header.id, 'zstd')
+    const handle = await open(path, 'r')
+    const prototype = Object.getPrototypeOf(handle) as { sync: () => Promise<void> }
+    await handle.close()
+    const spy = vi.spyOn(prototype, 'sync')
+    // A batch with no turn boundary rides the OS writeback: no fsync.
+    await ctx.sessionPersistence.append(header.id, nonTurnBatch(0))
+    expect(spy.mock.calls.length).toBe(0)
+    // The turn/end boundary is the commit point: its batch is fsynced, and
+    // the appended events stay loadable.
+    await ctx.sessionPersistence.append(header.id, turnClosingBatch(2))
+    expect(spy.mock.calls.length).toBe(1)
+    const loaded = await ctx.sessionPersistence.load(header.id)
+    expect(loaded.events.map(event => event.type)).toEqual([
+      'user/message', 'step/start', 'turn/end',
+    ])
   })
 
   it('rolls back a checksummed append frame when fsync fails', async () => {
