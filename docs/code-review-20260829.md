@@ -123,6 +123,8 @@ English summary: see [优先修复清单](#优先修复清单按性价比排序)
 
 ### [P3-7] 3466 行测试夹具位于发布包 src 内
 
+> 2026-08-30 修正：该项为误报，撤销。复核确认 `fixture.ts` 并非测试夹具，而是已发布的浏览器运行时能力——客户端入口在 `?fixture` URL 模式下经 `createFixtureConnectionRpc` 提供无服务器的 UI 开发态，且随 `lib/client.js` 打包发布；`apps/web` 的多个 e2e 套件（`built-boot`、`goal-bar`、`seeded-history`、`agent-team-panel` 等）与 API gateway 客户端测试均驱动该模式，包描述亦声明 "and browser fixture"。将其移出发布面会破坏构建页面上的 `?fixture` 模式与整套 e2e；若未来要裁剪，需要构建期的 dev/production 条件拆分（bundles per build condition），属产品决策。
+
 - 位置：[packages/client/connection/src/client/fixture.ts:1](../packages/client/connection/src/client/fixture.ts#L1)
 - 描述：`client/connection` 的 src 携带一个超大夹具文件（打包后进入发布面或至少进入审计/克隆范围）。
 - 影响：包体积与审计噪音；夹具演进与产品代码耦合在同一个变更面上。
@@ -165,7 +167,7 @@ English summary: see [优先修复清单](#优先修复清单按性价比排序)
 10. **[P3-4] 静态资产缓存头** — 小改动；前端体验与带宽立竿见影。
 11. **[P3-6] JSONL sync 策略 Config 化** — 小改动 + 文档；高吞吐场景可选优化。
 12. **[P3-2] 拆分 core/tools、continuation、gateway 巨型模块** — 渐进重构；降低后续所有变更的审查成本。
-13. **[P3-7] client fixture 迁出 src** — 机械移动；减少发布面与审计噪音。
+13. ~~**[P3-7] client fixture 迁出 src**~~ — 撤销：复核确认该文件是已发布的浏览器 fixture 运行时模式（e2e 依赖），非测试夹具；见 P3-7 条目内的修正说明。
 14. **为 P1-1 补 Windows 集成测试** — 在 Windows CI 上断言"根自然退出 + 后代存活"场景被 terminate 覆盖；防止修复回退。
 15. **为 P1-2 补泄漏哨兵测试** — 断言 N 次超限命令后 tmpdir 中 `dsh-subprocess-*` 文件数为零（或等于保留策略允许值）。
 16. **spill 保留策略 Config 化**（随 1 实施）— `spillRetention: 'session' | 'command' | 'manual'`，默认 session，README 记录取舍。
