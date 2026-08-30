@@ -137,6 +137,17 @@ export function allocBytes(length: number): NativePtr {
 }
 
 /**
+ * Free one block allocated by {@link allocBytes}. Pairing rule: koffi.alloc'd
+ * memory must be freed here, never with LocalFree — a wrong-allocator free is
+ * undefined behavior at the FFI boundary (Win32-allocated SID/ACL blocks keep
+ * using {@link localFree}).
+ * @param ptr - pointer returned by {@link allocBytes}.
+ */
+export function freeBytes(ptr: NativePtr): void {
+  koffi.free(ptr)
+}
+
+/**
  * Allocate one zeroed x64 OVERLAPPED record.
  * @returns allocated pointer.
  * @remarks Koffi 3.1.1 crashes when LockFileEx or UnlockFileEx receives NULL;

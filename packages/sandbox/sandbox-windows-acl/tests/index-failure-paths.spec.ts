@@ -37,12 +37,19 @@ interface HappyStubs {
   getNamedSecurityInfoW: MockFn
 }
 
-const state = vi.hoisted(() => ({ stubs: undefined as HappyStubs | undefined }))
+const state = vi.hoisted(() => ({
+  stubs: undefined as HappyStubs | undefined,
+  freeBytes: undefined as unknown as ReturnType<typeof vi.fn>,
+}))
 
 vi.mock('../src/ffi.ts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/ffi.ts')>()
+  // Tracked so the allocator-pairing assertions can tell the koffi-heap SID
+  // frees (logon-SID copy, well-known SIDs) from the LocalAlloc frees.
+  state.freeBytes = vi.fn((ptr: NativePtr) => actual.freeBytes(ptr))
   return {
     ...actual,
+    freeBytes: (ptr: NativePtr) => state.freeBytes(ptr),
     win32: () => Promise.resolve(state.stubs?.api as Win32Bindings),
     win32Sync: () => state.stubs?.api as Win32Bindings,
   }
@@ -173,6 +180,7 @@ function happyStubs(): HappyStubs {
 
 beforeEach(() => {
   state.stubs = happyStubs()
+  state.freeBytes?.mockClear()
 })
 
 describe('AclSandbox constructor validation', () => {
@@ -352,7 +360,7 @@ describe('AclSandbox init', () => {
       tempWriteSid: 'S-1-4-9000-10-1',
       mode: 'workspace-write',
     })
-    await expect(sandbox.init()).rejects.toThrow(/5 cleanup operation\(s\) also failed/u)
+    await expect(sandbox.init()).rejects.toThrow(/3 cleanup operation\(s\) also failed/u)
     expect(sandbox.tempDir).toBeUndefined()
   })
 })
@@ -429,6 +437,19 @@ describe('AclSandbox dispose', () => {
     await sandbox.init()
     localFree.mockReturnValue(1n)
     expect(() => { sandbox.dispose() }).toThrow(AggregateError)
+  })
+
+  it('frees the two koffi-heap SIDs through koffi.free and the parsed write SID through LocalFree', async () => {
+    const { localFree } = state.stubs as HappyStubs
+    const workspace = scratch()
+    const sandbox = new AclSandbox({ writableDirs: [workspace], tempDir: null, writeSid: 'S-1-4-9000-19', mode: 'workspace-write' })
+    await sandbox.init()
+    const freeBytesCalls = state.freeBytes.mock.calls.length
+    sandbox.dispose()
+    // The logon-SID copy and the well-known SID live on the koffi heap; the
+    // ConvertStringSidToSidW SID lives on the LocalAlloc heap.
+    expect(state.freeBytes.mock.calls.length).toBe(freeBytesCalls + 2)
+    expect(localFree).toHaveBeenCalledTimes(1)
   })
 
   it('reports a failed close of the restricted token', async () => {

@@ -45,7 +45,7 @@ import { resolve } from 'node:path'
 import { Win32Error } from '@deepseek-ai/dsh-win32-process'
 
 import { grantWrite, revokeWrite } from './acl.ts'
-import { allocPtrSlot, decodePtr, isNullPtr, throwLastError, win32 } from './ffi.ts'
+import { allocPtrSlot, decodePtr, freeBytes as freeAllocatedBytes, isNullPtr, throwLastError, win32 } from './ffi.ts'
 import type { NativePtr, Win32Bindings } from './ffi.ts'
 import { assertPrivateTempDisjoint } from './path-boundary.ts'
 import { drainPipe, spawnSandboxed, spawnSandboxedInherited, waitForExit } from './spawn.ts'
@@ -129,7 +129,7 @@ export interface AclSandboxChild {
   wait(): Promise<AclSandboxChildResult>
 }
 
-/** Free one optional SID while retaining a failure for best-effort sibling cleanup. */
+/** Free one LocalAlloc'd SID best-effort, retaining failures for sibling cleanup. */
 function freeSidBestEffort(
   api: Win32Bindings,
   sidPtr: NativePtr | undefined,
@@ -140,6 +140,17 @@ function freeSidBestEffort(
   try {
     const freed = api.localFree(sidPtr)
     if (!isNullPtr(freed)) throwLastError(api, 'LocalFree', label)
+  } catch (error) {
+    failures.push(error)
+  }
+}
+
+/** Free one koffi.alloc'd block (the logon-SID copy, the well-known SIDs)
+ * best-effort — these live on the koffi heap and must never meet LocalFree —
+ * retaining failures for sibling cleanup. */
+function freeAllocatedBlockBestEffort(ptr: NativePtr, label: string, failures: unknown[]): void {
+  try {
+    freeAllocatedBytes(ptr)
   } catch (error) {
     failures.push(error)
   }
@@ -318,7 +329,7 @@ export class AclSandbox {
         freeSidBestEffort(api, sidPtr, label, cleanupFailures)
       }
       for (const sidPtr of this.sidAllocations.splice(0)) {
-        freeSidBestEffort(api, sidPtr, 'init SID allocation', cleanupFailures)
+        freeAllocatedBlockBestEffort(sidPtr, 'init SID allocation', cleanupFailures)
       }
       this.token = undefined
       this.writeSidPtr = undefined
@@ -417,7 +428,7 @@ export class AclSandbox {
       }
     }
     for (const sidPtr of this.sidAllocations.splice(0)) {
-      freeSidBestEffort(api, sidPtr, 'init SID allocation', failures)
+      freeAllocatedBlockBestEffort(sidPtr, 'dispose SID allocation', failures)
     }
     this.api = undefined
     this.token = undefined
